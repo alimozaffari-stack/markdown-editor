@@ -1,0 +1,44 @@
+@import "tailwindcss";
+
+/* Relative positioning for Tiptap headings to allow absolute collapse button alignment */
+.ProseMirror h1,
+.ProseMirror h2,
+.ProseMirror h3,
+.ProseMirror h4,
+.ProseMirror h5,
+.ProseMirror h6 {
+  position: relative;
+}
+
+/* Slide collapse buttons into view on hover */
+.ProseMirror h1 .heading-collapse-btn,
+.ProseMirror h2 .heading-collapse-btn,
+.ProseMirror h3 .heading-collapse-btn,
+.ProseMirror h4 .heading-collapse-btn,
+.ProseMirror h5 .heading-collapse-btn,
+.ProseMirror h6 .heading-collapse-btn {
+  opacity: 0;
+  transition: opacity 0.2s ease, background-color 0.15s ease;
+}
+
+.ProseMirror h1:hover .heading-collapse-btn,
+.ProseMirror h2:hover .heading-collapse-btn,
+.ProseMirror h3:hover .heading-collapse-btn,
+.ProseMirror h4:hover .heading-collapse-btn,
+.ProseMirror h5:hover .heading-collapse-btn,
+.ProseMirror h6:hover .heading-collapse-btn,
+.heading-collapse-btn:hover {
+  opacity: 1;
+}
+
+/* Custom Scrollbar for Outline view */
+.scrollbar-thin::-webkit-scrollbar {
+  width: 4px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgb(var(--border) / 0.5);
+  border-radius: 2px;
+}
