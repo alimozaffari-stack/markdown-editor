@@ -12,7 +12,7 @@ releases, support and roadmap are maintained here.
 
 [Releases](https://github.com/alimozaffari-stack/markdown-editor/releases) · [Source code](https://github.com/alimozaffari-stack/markdown-editor)
 
-## Current release candidate: v1.0.1
+## Current release candidate: v1.0.2
 
 This release candidate incorporates upstream v1.0.0 improvements while
 preserving the additions made in this edition, including Find and Replace,
