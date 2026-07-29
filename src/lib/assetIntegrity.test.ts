@@ -34,3 +34,15 @@ test("native packaging PNG assets retain valid binary signatures", () => {
     assert.deepEqual(bytes.subarray(0, pngSignature.length), pngSignature, asset);
   }
 });
+
+test("Windows NSIS installer uses the branded application icon", () => {
+  const config = JSON.parse(
+    readFileSync(resolve(process.cwd(), "src-tauri/tauri.conf.json"), "utf8"),
+  );
+  const installerIcon = config.bundle?.windows?.nsis?.installerIcon;
+
+  assert.equal(installerIcon, "icons/icon.ico");
+
+  const icon = readFileSync(resolve(process.cwd(), "src-tauri", installerIcon));
+  assert.deepEqual(icon.subarray(0, 4), Buffer.from([0, 0, 1, 0]));
+});
