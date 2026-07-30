@@ -392,6 +392,34 @@ fn write_synced(path: &Path, bytes: &[u8], create_new: bool) -> io::Result<()> {
     file.sync_all()
 }
 
+fn ensure_private_recovery_directory(recovery_directory: &Path) -> io::Result<()> {
+    fs::create_dir_all(recovery_directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(recovery_directory, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn write_recovery_copy(path: &Path, _target: &Path, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    let target_permissions = fs::metadata(_target)?.permissions();
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(target_permissions.mode());
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(target_permissions)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()
+}
+
 fn preserve_target_permissions(temporary: &Path, target: &Path) -> io::Result<()> {
     let permissions = fs::metadata(target)?.permissions();
     fs::set_permissions(temporary, permissions)?;
@@ -404,14 +432,14 @@ fn persist_recovery_draft(
     baseline_hash: &str,
     bytes: &[u8],
 ) -> Result<PathBuf, SaveFailure> {
-    fs::create_dir_all(recovery_directory).map_err(|error| {
+    ensure_private_recovery_directory(recovery_directory).map_err(|error| {
         SaveFailure::new(
             SaveFailureKind::TemporaryWrite,
             format!("Failed to create recovery directory: {error}"),
         )
     })?;
     let draft_path = recovery_directory.join(recovery_file_name(target, baseline_hash, "draft"));
-    write_synced(&draft_path, bytes, false).map_err(|error| {
+    write_recovery_copy(&draft_path, target, bytes).map_err(|error| {
         SaveFailure::new(
             SaveFailureKind::TemporaryWrite,
             format!("Failed to persist recovery draft: {error}"),
@@ -425,10 +453,16 @@ pub fn retain_recovery_draft(
     recovery_directory: &Path,
     request: &SaveDocumentRequest,
 ) -> Result<PathBuf, SaveFailure> {
+    let resolved_target = fs::canonicalize(target).map_err(|error| {
+        SaveFailure::new(
+            SaveFailureKind::Io,
+            format!("Failed to resolve document path: {error}"),
+        )
+    })?;
     let (_, encoded_candidate) = candidate_bytes(request)?;
     persist_recovery_draft(
         recovery_directory,
-        target,
+        &resolved_target,
         &request.baseline_hash,
         &encoded_candidate,
     )
@@ -440,8 +474,9 @@ fn persist_prior_version(
     baseline_hash: &str,
     bytes: &[u8],
 ) -> io::Result<PathBuf> {
+    ensure_private_recovery_directory(recovery_directory)?;
     let prior_path = recovery_directory.join(recovery_file_name(target, baseline_hash, "previous"));
-    write_synced(&prior_path, bytes, false)?;
+    write_recovery_copy(&prior_path, target, bytes)?;
     Ok(prior_path)
 }
 
@@ -522,6 +557,7 @@ enum InjectedFailure {
     TemporaryWrite,
     Validation,
     Replacement,
+    DirectorySync,
 }
 
 pub fn save_document(
@@ -538,6 +574,13 @@ fn save_document_inner(
     request: &SaveDocumentRequest,
     injected_failure: Option<InjectedFailure>,
 ) -> Result<DocumentSnapshot, SaveFailure> {
+    let resolved_target = fs::canonicalize(target).map_err(|error| {
+        SaveFailure::new(
+            SaveFailureKind::Io,
+            format!("Failed to resolve document path: {error}"),
+        )
+    })?;
+    let target = resolved_target.as_path();
     let (current, current_bytes) = read_document_with_bytes(target)?;
     let (candidate_content, encoded_candidate) = candidate_bytes(request)?;
 
@@ -696,13 +739,17 @@ fn save_document_inner(
         )
         .with_draft(&draft_path));
     }
-    if let Err(error) = sync_parent_directory(target) {
-        return Err(SaveFailure::new(
-            SaveFailureKind::Replacement,
-            format!("Failed to synchronise the document directory: {error}"),
-        )
-        .with_draft(&draft_path));
-    }
+    let directory_sync = if injected_failure == Some(InjectedFailure::DirectorySync) {
+        Err(io::Error::other(
+            "Injected directory synchronisation failure",
+        ))
+    } else {
+        sync_parent_directory(target)
+    };
+    // Replacement has already committed at this point. Some network and FUSE
+    // filesystems do not support directory fsync, so reload the installed file
+    // and return its snapshot rather than leaving the caller on a stale baseline.
+    let _ = directory_sync;
 
     let saved = load_document(target).map_err(|error| error.with_draft(&draft_path))?;
     let _ = fs::remove_file(&draft_path);
@@ -992,6 +1039,115 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_artifacts_inherit_private_document_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("temporary directory");
+        let recovery = directory.path().join("recovery");
+        let target = directory.path().join("private.md");
+        fs::write(&target, "# Private\n").expect("fixture write");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+            .expect("set private permissions");
+        let baseline = load_document(&target).expect("baseline");
+        let request = save_request(&baseline, "# Private revision\n", DocumentAuthority::Source);
+
+        let draft = retain_recovery_draft(&target, &recovery, &request).expect("recovery draft");
+        assert_eq!(
+            fs::metadata(&recovery)
+                .expect("recovery directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&draft)
+                .expect("recovery draft metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        save_document(&target, &recovery, &request).expect("atomic save");
+        let previous = recovery.join(recovery_file_name(&target, &baseline.hash, "previous"));
+        assert_eq!(
+            fs::metadata(previous)
+                .expect("previous version metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_updates_a_symlink_target_without_replacing_the_link() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().expect("temporary directory");
+        let recovery = directory.path().join("recovery");
+        let actual_directory = directory.path().join("actual");
+        let managed_directory = directory.path().join("managed");
+        fs::create_dir_all(&actual_directory).expect("actual directory");
+        fs::create_dir_all(&managed_directory).expect("managed directory");
+        let actual = actual_directory.join("note.md");
+        let managed_link = managed_directory.join("note.md");
+        fs::write(&actual, "# Linked original\n").expect("linked fixture");
+        symlink(&actual, &managed_link).expect("managed symlink");
+        let baseline = load_document(&managed_link).expect("linked baseline");
+
+        save_document(
+            &managed_link,
+            &recovery,
+            &save_request(&baseline, "# Linked revision\n", DocumentAuthority::Source),
+        )
+        .expect("linked atomic save");
+
+        assert!(fs::symlink_metadata(&managed_link)
+            .expect("managed link metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_to_string(&actual).expect("linked target contents"),
+            "# Linked revision\n"
+        );
+    }
+
+    #[test]
+    fn post_replacement_directory_sync_failure_returns_the_committed_snapshot() {
+        let directory = tempdir().expect("temporary directory");
+        let recovery = directory.path().join("recovery");
+        let target = directory.path().join("note.md");
+        fs::write(&target, "# Original\n").expect("fixture write");
+        let baseline = load_document(&target).expect("baseline");
+
+        let saved = save_document_inner(
+            &target,
+            &recovery,
+            &save_request(
+                &baseline,
+                "# Committed revision\n",
+                DocumentAuthority::Source,
+            ),
+            Some(InjectedFailure::DirectorySync),
+        )
+        .expect("replacement is already committed");
+
+        assert_eq!(saved.content, "# Committed revision\n");
+        assert_eq!(
+            fs::read_to_string(&target).expect("committed target contents"),
+            "# Committed revision\n"
+        );
+        assert_ne!(saved.hash, baseline.hash);
+        assert!(!recovery
+            .join(recovery_file_name(&target, &baseline.hash, "draft",))
+            .exists());
     }
 
     #[test]
