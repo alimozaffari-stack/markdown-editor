@@ -20,14 +20,11 @@ import {
   parseNoteAnnotations,
 } from "../lib/noteAnnotations";
 import { createRebasedSaveQueue } from "../lib/rebasedSaveQueue";
+import { rebaseSaveRequestToSnapshot } from "../lib/noteSaveRebase";
 
-interface AnnotationState {
-  footnotes: Footnote[];
-  comments: Comment[];
-}
-
-interface SaveNoteOptions {
-  preserveOptimisticAnnotations?: boolean;
+interface QueuedNoteSave {
+  annotationVersion: number;
+  createRequest: (base: Note) => DocumentSaveRequest;
 }
 
 export function extractComments(content: string): { cleanContent: string; comments: Comment[] } {
@@ -263,15 +260,81 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   footnotesMapRef.current = footnotesMap;
   const currentNoteRef = useRef(currentNote);
   currentNoteRef.current = currentNote;
-  const annotationSaveQueueRef = useRef(
-    createRebasedSaveQueue<string, AnnotationState, Note>(),
+  const noteSaveQueueRef = useRef(
+    createRebasedSaveQueue<object, QueuedNoteSave, Note>(),
   );
+  const noteSaveQueueKeysRef = useRef(new Map<string, object>());
+  const activeNoteIdsRef = useRef(new Map<object, string>());
+  const blockedNoteSaveErrorsRef = useRef(new Map<object, unknown>());
+  const annotationVersionsRef = useRef(new Map<string, number>());
   // Monotonic counter to ignore stale async note selection responses.
   const selectRequestIdRef = useRef(0);
   // Monotonic counter to ignore stale async search responses
   const searchRequestIdRef = useRef(0);
   // Tracks the ID of a newly created note so Editor can focus its title.
   const pendingNewNoteIdRef = useRef<string | null>(null);
+
+  const getNoteSaveQueueKey = useCallback((id: string) => {
+    const existing = noteSaveQueueKeysRef.current.get(id);
+    if (existing) return existing;
+    const key = {};
+    noteSaveQueueKeysRef.current.set(id, key);
+    activeNoteIdsRef.current.set(key, id);
+    return key;
+  }, []);
+
+  const setNoteSaveQueueBase = useCallback(
+    (note: Note, previousId?: string) => {
+      const key = getNoteSaveQueueKey(previousId ?? note.id);
+      noteSaveQueueKeysRef.current.set(note.id, key);
+      activeNoteIdsRef.current.set(key, note.id);
+      blockedNoteSaveErrorsRef.current.delete(key);
+      noteSaveQueueRef.current.setBase(key, note);
+    },
+    [getNoteSaveQueueKey],
+  );
+
+  const installPreparedNote = useCallback(
+    (rawNote: Note, previousId?: string) => {
+      const prepared = prepareNoteForEditing(rawNote);
+      const sourceId = previousId ?? prepared.note.id;
+      const annotationVersion =
+        annotationVersionsRef.current.get(sourceId) ??
+        annotationVersionsRef.current.get(prepared.note.id) ??
+        0;
+
+      commentsMapRef.current = {
+        ...commentsMapRef.current,
+        [prepared.note.id]: prepared.comments,
+      };
+      footnotesMapRef.current = {
+        ...footnotesMapRef.current,
+        [prepared.note.id]: prepared.footnotes,
+      };
+      if (sourceId !== prepared.note.id) {
+        delete commentsMapRef.current[sourceId];
+        delete footnotesMapRef.current[sourceId];
+        annotationVersionsRef.current.delete(sourceId);
+      }
+      annotationVersionsRef.current.set(
+        prepared.note.id,
+        annotationVersion,
+      );
+      setCommentsMap(commentsMapRef.current);
+      setFootnotesMap(footnotesMapRef.current);
+      setNoteSaveQueueBase(prepared.note, sourceId);
+      currentNoteRef.current = prepared.note;
+      setCurrentNote(prepared.note);
+      return prepared.note;
+    },
+    [setNoteSaveQueueBase],
+  );
+
+  const bumpAnnotationVersion = useCallback((noteId: string) => {
+    const next = (annotationVersionsRef.current.get(noteId) ?? 0) + 1;
+    annotationVersionsRef.current.set(noteId, next);
+    return next;
+  }, []);
 
   const refreshNotes = useCallback(async () => {
     if (!notesFolder) return;
@@ -301,6 +364,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         pendingNewNoteIdRef.current = null;
       }
       // Set selected ID immediately for responsive UI
+      selectedNoteIdRef.current = id;
       setSelectedNoteId(id);
       setHasExternalChanges(false);
       // Expand parent folders so the note is visible in the tree
@@ -314,47 +378,26 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
       const note = await notesService.readNote(id);
       if (requestId !== selectRequestIdRef.current) return;
-      const prepared = prepareNoteForEditing(note);
-      setFootnotesMap((prev) => ({
-        ...prev,
-        [id]: prepared.footnotes,
-      }));
-      setCommentsMap((prev) => ({
-        ...prev,
-        [id]: prepared.comments,
-      }));
-      annotationSaveQueueRef.current.setBase(id, prepared.note);
-      setCurrentNote(prepared.note);
+      installPreparedNote(note);
     } catch (err) {
       if (requestId !== selectRequestIdRef.current) return;
       setError(err instanceof Error ? err.message : "Failed to load note");
     }
-  }, []);
+  }, [installPreparedNote]);
 
   const reloadCurrentNote = useCallback(async () => {
-    if (!selectedNoteIdRef.current) return;
+    const noteId = selectedNoteIdRef.current;
+    if (!noteId) return;
     try {
-      const note = await notesService.readNote(selectedNoteIdRef.current);
-      const prepared = prepareNoteForEditing(note);
-      setFootnotesMap((prev) => ({
-        ...prev,
-        [selectedNoteIdRef.current!]: prepared.footnotes,
-      }));
-      setCommentsMap((prev) => ({
-        ...prev,
-        [selectedNoteIdRef.current!]: prepared.comments,
-      }));
-      annotationSaveQueueRef.current.setBase(
-        selectedNoteIdRef.current,
-        prepared.note,
-      );
-      setCurrentNote(prepared.note);
+      const note = await notesService.readNote(noteId);
+      if (selectedNoteIdRef.current !== noteId) return;
+      installPreparedNote(note);
       setHasExternalChanges(false);
       setReloadVersion((v) => v + 1);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to reload note");
     }
-  }, []);
+  }, [installPreparedNote]);
 
   const createNote = useCallback(async () => {
     try {
@@ -373,7 +416,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       // Mark as recently saved to ignore file-change events from our own creation
       recentlySavedRef.current.add(note.id);
       await refreshNotes();
-      setCurrentNote(note);
+      installPreparedNote(note);
+      selectedNoteIdRef.current = note.id;
       setSelectedNoteId(note.id);
       // Clear search when creating a new note
       setSearchQuery("");
@@ -384,7 +428,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create note");
     }
-  }, [refreshNotes]);
+  }, [installPreparedNote, refreshNotes]);
 
   const consumePendingNewNote = useCallback((id: string) => {
     if (pendingNewNoteIdRef.current !== id) {
@@ -395,105 +439,154 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     return true;
   }, []);
 
-  const saveNote = useCallback(
-    async (
-      request: DocumentSaveRequest,
-      noteId?: string,
-      options?: SaveNoteOptions,
-    ) => {
-      // Use provided noteId (for flush saves) or fall back to currentNote.id
-      const savingNoteId = noteId || currentNote?.id;
-      if (!savingNoteId) return null;
-      let updatedId: string | null = null;
+  const enqueueNoteSave = useCallback(
+    async (requestedNoteId: string, queuedSave: QueuedNoteSave) => {
+      const queueKey = getNoteSaveQueueKey(requestedNoteId);
+      const blockedError = blockedNoteSaveErrorsRef.current.get(queueKey);
+      if (blockedError !== undefined) throw blockedError;
+      return noteSaveQueueRef.current.enqueue(
+        queueKey,
+        queuedSave,
+        {
+          load: async (key) => {
+            const blockedSaveError =
+              blockedNoteSaveErrorsRef.current.get(key);
+            if (blockedSaveError !== undefined) {
+              throw blockedSaveError;
+            }
+            const activeId =
+              activeNoteIdsRef.current.get(key) ?? requestedNoteId;
+            const loaded = prepareNoteForEditing(
+              await notesService.readNote(activeId),
+            ).note;
+            noteSaveQueueKeysRef.current.set(loaded.id, key);
+            activeNoteIdsRef.current.set(key, loaded.id);
+            return loaded;
+          },
+          save: async (key, operation, base) => {
+            const savingNoteId = base.id;
+            recentlySavedRef.current.add(savingNoteId);
+            try {
+              const updated = await notesService.saveNote(
+                savingNoteId,
+                operation.createRequest(base),
+              );
+              const prepared = prepareNoteForEditing(updated);
+              noteSaveQueueKeysRef.current.set(updated.id, key);
+              activeNoteIdsRef.current.set(key, updated.id);
+              if (updated.id !== savingNoteId) {
+                recentlySavedRef.current.add(updated.id);
+              }
 
-      try {
-        // Mark this note as recently saved to ignore file-change events from our own save
-        recentlySavedRef.current.add(savingNoteId);
+              const currentAnnotationVersion =
+                annotationVersionsRef.current.get(savingNoteId) ??
+                annotationVersionsRef.current.get(requestedNoteId) ??
+                0;
+              const annotationsAreCurrent =
+                currentAnnotationVersion === operation.annotationVersion;
+              const latestComments =
+                commentsMapRef.current[savingNoteId] ??
+                commentsMapRef.current[requestedNoteId] ??
+                prepared.comments;
+              const latestFootnotes =
+                footnotesMapRef.current[savingNoteId] ??
+                footnotesMapRef.current[requestedNoteId] ??
+                prepared.footnotes;
 
-        const storageRequest = prepareStorageSaveRequest(
-          request,
-          footnotesMapRef.current[savingNoteId] || [],
-          commentsMapRef.current[savingNoteId] || [],
-        );
-        const updated = await notesService.saveNote(
-          savingNoteId,
-          storageRequest,
-        );
-        const prepared = prepareNoteForEditing(updated);
-        updatedId = updated.id;
-        if (updated.id !== savingNoteId) {
-          annotationSaveQueueRef.current.clearBase(savingNoteId);
-        }
-        annotationSaveQueueRef.current.setBase(updated.id, prepared.note);
+              commentsMapRef.current = {
+                ...commentsMapRef.current,
+                [updated.id]: annotationsAreCurrent
+                  ? prepared.comments
+                  : latestComments,
+              };
+              footnotesMapRef.current = {
+                ...footnotesMapRef.current,
+                [updated.id]: annotationsAreCurrent
+                  ? prepared.footnotes
+                  : latestFootnotes,
+              };
+              for (const staleId of [requestedNoteId, savingNoteId]) {
+                if (staleId !== updated.id) {
+                  delete commentsMapRef.current[staleId];
+                  delete footnotesMapRef.current[staleId];
+                  annotationVersionsRef.current.delete(staleId);
+                }
+              }
+              annotationVersionsRef.current.set(
+                updated.id,
+                currentAnnotationVersion,
+              );
+              setCommentsMap(commentsMapRef.current);
+              setFootnotesMap(footnotesMapRef.current);
+              setHasExternalChanges(false);
 
-        // If the note was renamed (ID changed), also mark the new ID
-        if (updated.id !== savingNoteId) {
-          recentlySavedRef.current.add(updated.id);
+              if (
+                selectedNoteIdRef.current === requestedNoteId ||
+                selectedNoteIdRef.current === savingNoteId
+              ) {
+                selectedNoteIdRef.current = updated.id;
+                currentNoteRef.current = prepared.note;
+                setSelectedNoteId(updated.id);
+                setCurrentNote(prepared.note);
+              }
 
-          // Transfer pin status to new ID
-          const currentSettings = await notesService.getSettings();
-          const pinnedIds = currentSettings.pinnedNoteIds || [];
-          if (pinnedIds.includes(savingNoteId)) {
-            const updatedSettings = {
-              ...currentSettings,
-              pinnedNoteIds: pinnedIds.map((id) =>
-                id === savingNoteId ? updated.id : id
-              ),
-            };
-            await notesService.updateSettings(updatedSettings);
-          }
-        }
-        if (!options?.preserveOptimisticAnnotations) {
-          commentsMapRef.current = {
-            ...commentsMapRef.current,
-            [updated.id]: prepared.comments,
-          };
-          footnotesMapRef.current = {
-            ...footnotesMapRef.current,
-            [updated.id]: prepared.footnotes,
-          };
-          if (updated.id !== savingNoteId) {
-            delete commentsMapRef.current[savingNoteId];
-            delete footnotesMapRef.current[savingNoteId];
-          }
-          setCommentsMap(commentsMapRef.current);
-          setFootnotesMap(footnotesMapRef.current);
-        }
-
-        // Clear external changes flag - if it was set by our own save, we want to ignore it
-        setHasExternalChanges(false);
-
-        // Only update state if we're still on the same note we started saving
-        // This prevents race conditions when user switches notes during save
-        setSelectedNoteId((prevId) => {
-          if (prevId === savingNoteId) {
-            // Update to the new ID if the note was renamed
-            setCurrentNote(prepared.note);
-            return updated.id;
-          }
-          // User switched to a different note, don't update current note
-          return prevId;
-        });
-
-        // Schedule refresh with debounce - avoids blocking typing during rapid saves
-        scheduleRefresh();
-
-        // Clear the recently saved flag after a short delay
-        // (longer than the file watcher debounce of 500ms)
-        setTimeout(() => {
-          recentlySavedRef.current.delete(savingNoteId);
-          if (updatedId) recentlySavedRef.current.delete(updatedId);
-        }, 1000);
-        return prepared.note;
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to save note");
-        // Clean up immediately on error to avoid leaving stale entries
-        recentlySavedRef.current.delete(savingNoteId);
-        if (updatedId) recentlySavedRef.current.delete(updatedId);
-        throw err;
-      }
+              scheduleRefresh();
+              setTimeout(() => {
+                recentlySavedRef.current.delete(savingNoteId);
+                recentlySavedRef.current.delete(updated.id);
+              }, 1000);
+              return prepared.note;
+            } catch (error) {
+              recentlySavedRef.current.delete(savingNoteId);
+              if (
+                typeof error === "object" &&
+                error !== null &&
+                "kind" in error &&
+                error.kind === "conflict"
+              ) {
+                blockedNoteSaveErrorsRef.current.set(key, error);
+              }
+              setError(
+                error instanceof Error
+                  ? error.message
+                  : "Failed to save note",
+              );
+              throw error;
+            }
+          },
+        },
+      );
     },
-    [currentNote, scheduleRefresh]
+    [getNoteSaveQueueKey, scheduleRefresh],
+  );
+
+  const saveNote = useCallback(
+    async (request: DocumentSaveRequest, noteId?: string) => {
+      const savingNoteId = noteId ?? currentNoteRef.current?.id;
+      if (!savingNoteId) return null;
+      const annotationVersion =
+        annotationVersionsRef.current.get(savingNoteId) ?? 0;
+
+      return enqueueNoteSave(savingNoteId, {
+        annotationVersion,
+        createRequest: (base) => {
+          const rebasedRequest = rebaseSaveRequestToSnapshot(
+            request,
+            base.snapshot,
+          );
+          return prepareStorageSaveRequest(
+            rebasedRequest,
+            footnotesMapRef.current[base.id] ??
+              footnotesMapRef.current[savingNoteId] ??
+              [],
+            commentsMapRef.current[base.id] ??
+              commentsMapRef.current[savingNoteId] ??
+              [],
+          );
+        },
+      });
+    },
+    [enqueueNoteSave],
   );
 
   const retainRecoveryDraft = useCallback(
@@ -536,14 +629,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           await notesService.updateSettings(updatedSettings);
         }
 
-        // Only clear selection if we're deleting the currently selected note
-        setSelectedNoteId((prevId) => {
-          if (prevId === id) {
-            setCurrentNote(null);
-            return null;
-          }
-          return prevId;
-        });
+        if (selectedNoteIdRef.current === id) {
+          selectedNoteIdRef.current = null;
+          currentNoteRef.current = null;
+          setSelectedNoteId(null);
+          setCurrentNote(null);
+        }
         await refreshNotes();
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to delete note");
@@ -561,7 +652,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // Mark as recently saved to ignore file-change events from our own creation
         recentlySavedRef.current.add(newNote.id);
         await refreshNotes();
-        setCurrentNote(newNote);
+        installPreparedNote(newNote);
+        selectedNoteIdRef.current = newNote.id;
         setSelectedNoteId(newNote.id);
         setTimeout(() => {
           recentlySavedRef.current.delete(newNote.id);
@@ -570,7 +662,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         setError(err instanceof Error ? err.message : "Failed to duplicate note");
       }
     },
-    [refreshNotes]
+    [installPreparedNote, refreshNotes]
   );
 
   const pinNote = useCallback(
@@ -619,45 +711,31 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       footnotes: Footnote[],
       comments: Comment[],
     ) => {
-      await annotationSaveQueueRef.current.enqueue(
-        noteId,
-        { footnotes, comments },
-        {
-          load: async (queuedNoteId) =>
-            currentNoteRef.current?.id === queuedNoteId
-              ? currentNoteRef.current
-              : prepareNoteForEditing(
-                  await notesService.readNote(queuedNoteId),
-                ).note,
-          save: async (queuedNoteId, annotations, loaded) => {
-            const storageContent = appendComments(
-              appendFootnotes(loaded.content, annotations.footnotes),
-              annotations.comments,
-            );
-            const saved = await saveNote(
-              {
-                ...notesService.createSaveRequest(
-                  loaded.snapshot,
-                  storageContent,
-                ),
-                contentIsStorageSource: true,
-              },
-              queuedNoteId,
-              { preserveOptimisticAnnotations: true },
-            );
-            if (!saved) {
-              throw new Error("The annotation save did not return a document");
-            }
-            return saved;
-          },
+      const annotationVersion =
+        annotationVersionsRef.current.get(noteId) ?? 0;
+      await enqueueNoteSave(noteId, {
+        annotationVersion,
+        createRequest: (base) => {
+          const storageContent = appendComments(
+            appendFootnotes(base.content, footnotes),
+            comments,
+          );
+          return {
+            ...notesService.createSaveRequest(
+              base.snapshot,
+              storageContent,
+            ),
+            contentIsStorageSource: true,
+          };
         },
-      );
+      });
     },
-    [saveNote],
+    [enqueueNoteSave],
   );
 
   const addComment = useCallback(
     async (noteId: string, text: string) => {
+      bumpAnnotationVersion(noteId);
       const newComment: Comment = {
         id: crypto.randomUUID(),
         text,
@@ -681,11 +759,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         updatedComments,
       );
     },
-    [persistAnnotations],
+    [bumpAnnotationVersion, persistAnnotations],
   );
 
   const deleteComment = useCallback(
     async (noteId: string, commentId: string) => {
+      bumpAnnotationVersion(noteId);
       const updatedComments = (
         commentsMapRef.current[noteId] || []
       ).filter((comment) => comment.id !== commentId);
@@ -703,11 +782,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         updatedComments,
       );
     },
-    [persistAnnotations],
+    [bumpAnnotationVersion, persistAnnotations],
   );
 
   const addFootnote = useCallback(
     async (noteId: string, id: string, text: string) => {
+      bumpAnnotationVersion(noteId);
       const currentFootnotes = footnotesMapRef.current[noteId] || [];
       const exists = currentFootnotes.some(
         (footnote) => footnote.id === id,
@@ -731,11 +811,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         commentsMapRef.current[noteId] || [],
       );
     },
-    [persistAnnotations],
+    [bumpAnnotationVersion, persistAnnotations],
   );
 
   const updateFootnote = useCallback(
     async (noteId: string, id: string, text: string) => {
+      bumpAnnotationVersion(noteId);
       const updatedFootnotes = (
         footnotesMapRef.current[noteId] || []
       ).map((footnote) =>
@@ -755,11 +836,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         commentsMapRef.current[noteId] || [],
       );
     },
-    [persistAnnotations],
+    [bumpAnnotationVersion, persistAnnotations],
   );
 
   const deleteFootnote = useCallback(
     async (noteId: string, id: string) => {
+      bumpAnnotationVersion(noteId);
       const updatedFootnotes = (
         footnotesMapRef.current[noteId] || []
       ).filter((footnote) => footnote.id !== id);
@@ -777,7 +859,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         commentsMapRef.current[noteId] || [],
       );
     },
-    [persistAnnotations],
+    [bumpAnnotationVersion, persistAnnotations],
   );
 
   const createNoteInFolder = useCallback(
@@ -789,7 +871,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         pendingNewNoteIdRef.current = note.id;
         recentlySavedRef.current.add(note.id);
         await refreshNotes();
-        setCurrentNote(note);
+        installPreparedNote(note);
+        selectedNoteIdRef.current = note.id;
         setSelectedNoteId(note.id);
         setSearchQuery("");
         setSearchResults([]);
@@ -802,7 +885,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         );
       }
     },
-    [refreshNotes]
+    [installPreparedNote, refreshNotes]
   );
 
   const createFolderAction = useCallback(
@@ -824,14 +907,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     async (path: string) => {
       try {
         await notesService.deleteFolder(path);
-        // If the selected note was inside the deleted folder, clear selection
-        setSelectedNoteId((prevId) => {
-          if (prevId && prevId.startsWith(path + "/")) {
-            setCurrentNote(null);
-            return null;
-          }
-          return prevId;
-        });
+        if (selectedNoteIdRef.current?.startsWith(path + "/")) {
+          selectedNoteIdRef.current = null;
+          currentNoteRef.current = null;
+          setSelectedNoteId(null);
+          setCurrentNote(null);
+        }
         await refreshNotes();
       } catch (err) {
         setError(
@@ -856,19 +937,17 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         const oldPrefix = oldPath + "/";
         const newPrefix = newPath + "/";
 
-        // Update selectedNoteId if it was inside the renamed folder
-        setSelectedNoteId((prevId) => {
-          if (prevId && prevId.startsWith(oldPrefix)) {
-            const newId = newPrefix + prevId.substring(oldPrefix.length);
-            notesService.readNote(newId).then((note) => {
-              setCurrentNote(note);
-            }).catch((err) => {
-              setError(err instanceof Error ? err.message : "Failed to read renamed note");
-            });
-            return newId;
+        const selectedId = selectedNoteIdRef.current;
+        if (selectedId?.startsWith(oldPrefix)) {
+          const newId =
+            newPrefix + selectedId.substring(oldPrefix.length);
+          selectedNoteIdRef.current = newId;
+          setSelectedNoteId(newId);
+          const note = await notesService.readNote(newId);
+          if (selectedNoteIdRef.current === newId) {
+            installPreparedNote(note, selectedId);
           }
-          return prevId;
-        });
+        }
 
         await refreshNotes();
       } catch (err) {
@@ -877,7 +956,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         );
       }
     },
-    [refreshNotes]
+    [installPreparedNote, refreshNotes]
   );
 
   const moveNoteAction = useCallback(
@@ -885,23 +964,20 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       try {
         const newId = await notesService.moveNote(id, targetFolder);
         // Update selection if we moved the selected note
-        setSelectedNoteId((prevId) => {
-          if (prevId === id) {
-            notesService.readNote(newId).then((note) => {
-              setCurrentNote(note);
-            }).catch((err) => {
-              setError(err instanceof Error ? err.message : "Failed to read moved note");
-            });
-            return newId;
+        if (selectedNoteIdRef.current === id) {
+          selectedNoteIdRef.current = newId;
+          setSelectedNoteId(newId);
+          const note = await notesService.readNote(newId);
+          if (selectedNoteIdRef.current === newId) {
+            installPreparedNote(note, id);
           }
-          return prevId;
-        });
+        }
         await refreshNotes();
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to move note");
       }
     },
-    [refreshNotes]
+    [installPreparedNote, refreshNotes]
   );
 
   const moveFolderAction = useCallback(
@@ -919,26 +995,24 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         const oldPrefix = path + "/";
         const newPrefix = newPath + "/";
 
-        // Update selectedNoteId if it was inside the moved folder
-        setSelectedNoteId((prevId) => {
-          if (prevId && prevId.startsWith(oldPrefix)) {
-            const newId = newPrefix + prevId.substring(oldPrefix.length);
-            notesService.readNote(newId).then((note) => {
-              setCurrentNote(note);
-            }).catch((err) => {
-              setError(err instanceof Error ? err.message : "Failed to read moved note");
-            });
-            return newId;
+        const selectedId = selectedNoteIdRef.current;
+        if (selectedId?.startsWith(oldPrefix)) {
+          const newId =
+            newPrefix + selectedId.substring(oldPrefix.length);
+          selectedNoteIdRef.current = newId;
+          setSelectedNoteId(newId);
+          const note = await notesService.readNote(newId);
+          if (selectedNoteIdRef.current === newId) {
+            installPreparedNote(note, selectedId);
           }
-          return prevId;
-        });
+        }
 
         await refreshNotes();
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to move folder");
       }
     },
-    [refreshNotes]
+    [installPreparedNote, refreshNotes]
   );
 
   const setNotesFolder = useCallback(async (path: string) => {
@@ -959,6 +1033,8 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const syncNotesFolder = useCallback(async (path: string) => {
     try {
       setNotesFolderState(path);
+      selectedNoteIdRef.current = null;
+      currentNoteRef.current = null;
       setSelectedNoteId(null);
       setCurrentNote(null);
       const notesList = await notesService.listNotes();

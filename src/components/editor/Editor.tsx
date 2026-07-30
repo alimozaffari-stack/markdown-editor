@@ -711,12 +711,13 @@ export function Editor({
 
   const saveDocument = previewMode
     ? async (request: DocumentSaveRequest, _noteId?: string) => {
-        return previewMode.save(request);
+        const snapshot = await previewMode.save(request);
+        return { id: previewMode.filePath, snapshot };
       }
     : async (request: DocumentSaveRequest, noteId?: string) => {
         const note = await notesCtx!.saveNote(request, noteId);
         if (!note) throw new Error("No note is selected");
-        return note.snapshot;
+        return { id: note.id, snapshot: note.snapshot };
       };
   const retainRecoveryDraft = previewMode
     ? async (request: DocumentSaveRequest, _noteId?: string) =>
@@ -801,6 +802,7 @@ export function Editor({
   const blockMathPopupRef = useRef<TippyInstance | null>(null);
   const isLoadingRef = useRef(false);
   const documentSessionRef = useRef<DocumentSession | null>(null);
+  const sessionNoteIdsRef = useRef(new WeakMap<DocumentSession, string>());
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<TiptapEditor | null>(null);
@@ -964,6 +966,9 @@ export function Editor({
         setIsUnsaved(false);
         return Promise.resolve();
       }
+      if (!sessionNoteIdsRef.current.has(session)) {
+        sessionNoteIdsRef.current.set(session, noteId);
+      }
 
       let validationError: Error | null = null;
       if (request.authority === "visual" && editorRef.current) {
@@ -999,10 +1004,12 @@ export function Editor({
             bom: baseline.bom,
             lineEnding: baseline.lineEnding,
           };
+          const activeNoteId =
+            sessionNoteIdsRef.current.get(session) ?? noteId;
           if (validationError) {
             const draftPath = await retainRecoveryDraft(
               executableRequest,
-              noteId,
+              activeNoteId,
             );
             throw {
               kind: "validation",
@@ -1010,9 +1017,16 @@ export function Editor({
               draftPath,
             } satisfies DocumentSaveFailure;
           }
-          const snapshot = await saveDocument(executableRequest, noteId);
-          lastSaveRef.current = { noteId, content: snapshot.content };
-          session.markSaved(snapshot, executableRequest);
+          const saved = await saveDocument(
+            executableRequest,
+            activeNoteId,
+          );
+          sessionNoteIdsRef.current.set(session, saved.id);
+          lastSaveRef.current = {
+            noteId,
+            content: saved.snapshot.content,
+          };
+          session.markSaved(saved.snapshot, executableRequest);
           if (isCurrentSession()) {
             setSaveConflict(null);
             setIsUnsaved(session.isDirty);

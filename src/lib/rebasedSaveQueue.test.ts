@@ -3,6 +3,7 @@ import test from "node:test";
 import { createRebasedSaveQueue } from "./rebasedSaveQueue.ts";
 
 interface Snapshot {
+  id?: string;
   hash: string;
 }
 
@@ -87,4 +88,29 @@ test("a request after a failed save reloads its baseline", async () => {
 
   assert.equal(loadCount, 1);
   assert.equal(recovered.hash, "disk:second");
+});
+
+test("a returned document identity is supplied to the next queued save", async () => {
+  const queue = createRebasedSaveQueue<string, string, Snapshot>();
+  queue.setBase("stable-key", { id: "old-name", hash: "baseline" });
+  const ids: Array<string | undefined> = [];
+
+  const operations = {
+    load: async () => {
+      throw new Error("the seeded baseline should be used");
+    },
+    save: async (_key: string, payload: string, base: Snapshot) => {
+      ids.push(base.id);
+      return {
+        id: payload === "rename" ? "new-name" : base.id,
+        hash: `${base.hash}:${payload}`,
+      };
+    },
+  };
+
+  const renamed = queue.enqueue("stable-key", "rename", operations);
+  const edited = queue.enqueue("stable-key", "edit", operations);
+  await Promise.all([renamed, edited]);
+
+  assert.deepEqual(ids, ["old-name", "new-name"]);
 });
