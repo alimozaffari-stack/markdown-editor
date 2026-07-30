@@ -1284,7 +1284,11 @@ mod tests {
         let failure = save_document(
             &target,
             &recovery,
-            &save_request(&baseline, "# Candidate revision\n", DocumentAuthority::Source),
+            &save_request(
+                &baseline,
+                "# Candidate revision\n",
+                DocumentAuthority::Source,
+            ),
         )
         .expect_err("multiply linked documents must not be replaced");
 
@@ -1299,13 +1303,8 @@ mod tests {
             "# Shared inode\n"
         );
         assert_eq!(
-            fs::read_to_string(
-                failure
-                    .draft_path
-                    .as_deref()
-                    .expect("retained draft path"),
-            )
-            .expect("draft contents"),
+            fs::read_to_string(failure.draft_path.as_deref().expect("retained draft path"),)
+                .expect("draft contents"),
             "# Candidate revision\n"
         );
     }
