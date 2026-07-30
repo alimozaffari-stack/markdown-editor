@@ -171,7 +171,7 @@ fn detect_line_ending(content: &str) -> DocumentLineEnding {
 }
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, SaveFailure> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(SaveFailure::new(
             SaveFailureKind::UnsupportedEncoding,
             "UTF-16 document has an incomplete code unit",
