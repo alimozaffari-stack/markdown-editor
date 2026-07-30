@@ -406,22 +406,22 @@ fn ensure_private_recovery_directory(recovery_directory: &Path) -> io::Result<()
     Ok(())
 }
 
-fn write_recovery_copy(path: &Path, _target: &Path, bytes: &[u8]) -> io::Result<()> {
-    #[cfg(unix)]
-    let target_permissions = fs::metadata(_target)?.permissions();
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        options.mode(target_permissions.mode());
+fn write_recovery_copy(path: &Path, target: &Path, bytes: &[u8]) -> io::Result<()> {
+    let target_permissions = fs::metadata(target)?.permissions();
+    let temporary = temporary_path(path).map_err(|error| io::Error::other(error.message))?;
+    let result = (|| {
+        write_synced(&temporary, bytes, true)?;
+        replace_recovery_copy(&temporary, path)?;
+        // Apply the target's mode only after the writable temporary has been
+        // installed. Reusing a read-only recovery filename must not make the
+        // next write fail before its bytes can be replaced.
+        fs::set_permissions(path, target_permissions)?;
+        File::open(path)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    file.set_permissions(target_permissions)?;
-    file.write_all(bytes)?;
-    file.flush()?;
-    file.sync_all()
+    result
 }
 
 fn preserve_target_permissions(temporary: &Path, target: &Path) -> io::Result<()> {
@@ -537,6 +537,43 @@ fn replace_file(temporary: &Path, target: &Path) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+fn replace_recovery_copy(temporary: &Path, target: &Path) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let original_permissions = match fs::metadata(target) {
+            Ok(metadata) => Some(metadata.permissions()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(permissions) = original_permissions.as_ref() {
+            if permissions.readonly() {
+                let mut writable = permissions.clone();
+                writable.set_readonly(false);
+                fs::set_permissions(target, writable)?;
+            }
+        }
+
+        if let Err(error) = replace_file(temporary, target) {
+            if let Some(permissions) = original_permissions {
+                if let Err(restore_error) = fs::set_permissions(target, permissions) {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{error}; failed to restore recovery permissions: {restore_error}"
+                        ),
+                    ));
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        replace_file(temporary, target)
     }
 }
 
@@ -1101,6 +1138,55 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_recovery_artifacts_can_be_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("temporary directory");
+        let recovery = directory.path().join("recovery");
+        let target = directory.path().join("read-only.md");
+        fs::write(&target, "# Baseline\n").expect("fixture write");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o444))
+            .expect("set read-only permissions");
+        let baseline = load_document(&target).expect("baseline");
+
+        let first = retain_recovery_draft(
+            &target,
+            &recovery,
+            &save_request(
+                &baseline,
+                "# First candidate\n",
+                DocumentAuthority::Source,
+            ),
+        )
+        .expect("first recovery draft");
+        let second = retain_recovery_draft(
+            &target,
+            &recovery,
+            &save_request(
+                &baseline,
+                "# Replacement candidate\n",
+                DocumentAuthority::Source,
+            ),
+        )
+        .expect("replacement recovery draft");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            fs::read_to_string(&second).expect("replacement draft contents"),
+            "# Replacement candidate\n"
+        );
+        assert_eq!(
+            fs::metadata(second)
+                .expect("replacement draft metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
         );
     }
 

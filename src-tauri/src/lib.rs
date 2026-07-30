@@ -46,6 +46,8 @@ pub struct Note {
     pub path: String,
     pub modified: i64,
     pub snapshot: DocumentSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 // Theme color customization
@@ -1109,7 +1111,46 @@ async fn read_note(id: String, state: State<'_, AppState>) -> Result<Note, Strin
         path: file_path.to_string_lossy().into_owned(),
         modified,
         snapshot,
+        warning: None,
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CommittedHeadingRename {
+    id: String,
+    path: PathBuf,
+    warning: Option<String>,
+}
+
+fn reconcile_committed_heading_rename(
+    existing_id: &str,
+    desired_id: &str,
+    old_path: &Path,
+    desired_path: &Path,
+    rename_result: std::io::Result<()>,
+) -> CommittedHeadingRename {
+    if desired_id == existing_id {
+        return CommittedHeadingRename {
+            id: existing_id.to_string(),
+            path: old_path.to_path_buf(),
+            warning: None,
+        };
+    }
+
+    match rename_result {
+        Ok(()) => CommittedHeadingRename {
+            id: desired_id.to_string(),
+            path: desired_path.to_path_buf(),
+            warning: None,
+        },
+        Err(error) => CommittedHeadingRename {
+            id: existing_id.to_string(),
+            path: old_path.to_path_buf(),
+            warning: Some(format!(
+                "The content was saved under “{existing_id}”, but the note could not be renamed to “{desired_id}”: {error}"
+            )),
+        },
+    }
 }
 
 #[tauri::command]
@@ -1167,18 +1208,24 @@ async fn save_note(
         return Err(SaveFailure::new(SaveFailureKind::Io, "Note not found"));
     }
     let recovery_directory = get_document_recovery_path(&app).map_err(|error| error.to_string())?;
-    let mut snapshot = document::save_document(&old_file_path, &recovery_directory, &request)?;
+    let snapshot = document::save_document(&old_file_path, &recovery_directory, &request)?;
 
-    let file_path = abs_path_from_id(&folder_path, &final_id)?;
-    if final_id != existing_id {
-        if let Err(error) = fs::rename(&old_file_path, &file_path).await {
-            return Err(SaveFailure::new(
-                SaveFailureKind::Replacement,
-                format!("The content was saved safely, but the note could not be renamed: {error}"),
-            ));
-        }
-        snapshot = document::load_document(&file_path)?;
-    }
+    let desired_file_path = abs_path_from_id(&folder_path, &final_id)?;
+    let rename_result = if final_id == existing_id {
+        Ok(())
+    } else {
+        fs::rename(&old_file_path, &desired_file_path).await
+    };
+    let committed_path = reconcile_committed_heading_rename(
+        &existing_id,
+        &final_id,
+        &old_file_path,
+        &desired_file_path,
+        rename_result,
+    );
+    final_id = committed_path.id;
+    let file_path = committed_path.path;
+    let rename_warning = committed_path.warning;
 
     let metadata = fs::metadata(&file_path).await.map_err(|e| e.to_string())?;
     let modified = metadata
@@ -1222,7 +1269,37 @@ async fn save_note(
         path: file_path.to_string_lossy().into_owned(),
         modified,
         snapshot,
+        warning: rename_warning,
     })
+}
+
+#[cfg(test)]
+mod save_note_tests {
+    use super::*;
+
+    #[test]
+    fn failed_heading_rename_keeps_the_committed_note_identity() {
+        let old_path = PathBuf::from("/notes/Original.md");
+        let desired_path = PathBuf::from("/notes/Renamed.md");
+
+        let resolved = reconcile_committed_heading_rename(
+            "Original.md",
+            "Renamed.md",
+            &old_path,
+            &desired_path,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected rename denial",
+            )),
+        );
+
+        assert_eq!(resolved.id, "Original.md");
+        assert_eq!(resolved.path, old_path);
+        assert!(resolved
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("could not be renamed")));
+    }
 }
 
 #[tauri::command]
@@ -1385,6 +1462,7 @@ async fn create_note(
         path: file_path.to_string_lossy().into_owned(),
         modified,
         snapshot,
+        warning: None,
     })
 }
 

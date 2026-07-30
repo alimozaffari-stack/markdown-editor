@@ -28,6 +28,7 @@ export interface Note {
   path: string;
   modified: number;
   snapshot: DocumentSnapshot;
+  warning?: string;
 }
 
 export interface ThemeSettings {

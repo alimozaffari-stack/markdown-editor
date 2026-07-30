@@ -712,12 +712,16 @@ export function Editor({
   const saveDocument = previewMode
     ? async (request: DocumentSaveRequest, _noteId?: string) => {
         const snapshot = await previewMode.save(request);
-        return { id: previewMode.filePath, snapshot };
+        return { id: previewMode.filePath, snapshot, warning: undefined };
       }
     : async (request: DocumentSaveRequest, noteId?: string) => {
         const note = await notesCtx!.saveNote(request, noteId);
         if (!note) throw new Error("No note is selected");
-        return { id: note.id, snapshot: note.snapshot };
+        return {
+          id: note.id,
+          snapshot: note.snapshot,
+          warning: note.warning,
+        };
       };
   const retainRecoveryDraft = previewMode
     ? async (request: DocumentSaveRequest, _noteId?: string) =>
@@ -1021,6 +1025,7 @@ export function Editor({
             executableRequest,
             activeNoteId,
           );
+          if (saved.warning) toast.warning(saved.warning);
           sessionNoteIdsRef.current.set(session, saved.id);
           lastSaveRef.current = {
             noteId,
