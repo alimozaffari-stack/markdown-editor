@@ -217,7 +217,10 @@ export class DocumentSession {
 
   setPreserveSourceFormatting(enabled: boolean): void {
     this.preserveSourceFormatting = enabled;
-    if (enabled) this.authority = "source";
+    if (enabled) {
+      this.authority = "source";
+      this.setMode("source");
+    }
   }
 
   recordVisualEdit(content: string): boolean {

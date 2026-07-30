@@ -854,9 +854,12 @@ export function Editor({
     ) || false;
 
   useEffect(() => {
-    documentSessionRef.current?.setPreserveSourceFormatting(
-      preserveSourceFormatting,
-    );
+    const session = documentSessionRef.current;
+    session?.setPreserveSourceFormatting(preserveSourceFormatting);
+    if (preserveSourceFormatting && session) {
+      setSourceContent(toSourceEditorText(session.currentSourceContent));
+      setSourceMode(true);
+    }
   }, [preserveSourceFormatting]);
 
   // Find all matches for search query (case-insensitive)

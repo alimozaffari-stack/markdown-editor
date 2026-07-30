@@ -336,7 +336,46 @@ fn safe_file_component(path: &Path) -> String {
                 '-'
             }
         })
+        .take(96)
         .collect()
+}
+
+fn target_identity_bytes(target: &Path) -> Vec<u8> {
+    let canonical = fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        canonical.as_os_str().as_bytes().to_vec()
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        canonical
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        canonical.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+fn recovery_file_name(target: &Path, baseline_hash: &str, suffix: &str) -> String {
+    let target_hash = sha256_bytes(&target_identity_bytes(target));
+    let target_prefix = target_hash.get(..24).unwrap_or(&target_hash);
+    let baseline_prefix = baseline_hash.get(..12).unwrap_or(baseline_hash);
+    format!(
+        "{}.{}.{}.{}",
+        safe_file_component(target),
+        target_prefix,
+        baseline_prefix,
+        suffix
+    )
 }
 
 fn write_synced(path: &Path, bytes: &[u8], create_new: bool) -> io::Result<()> {
@@ -353,6 +392,12 @@ fn write_synced(path: &Path, bytes: &[u8], create_new: bool) -> io::Result<()> {
     file.sync_all()
 }
 
+fn preserve_target_permissions(temporary: &Path, target: &Path) -> io::Result<()> {
+    let permissions = fs::metadata(target)?.permissions();
+    fs::set_permissions(temporary, permissions)?;
+    File::open(temporary)?.sync_all()
+}
+
 fn persist_recovery_draft(
     recovery_directory: &Path,
     target: &Path,
@@ -365,12 +410,7 @@ fn persist_recovery_draft(
             format!("Failed to create recovery directory: {error}"),
         )
     })?;
-    let hash_prefix = baseline_hash.get(..12).unwrap_or(baseline_hash);
-    let draft_path = recovery_directory.join(format!(
-        "{}.{}.draft",
-        safe_file_component(target),
-        hash_prefix
-    ));
+    let draft_path = recovery_directory.join(recovery_file_name(target, baseline_hash, "draft"));
     write_synced(&draft_path, bytes, false).map_err(|error| {
         SaveFailure::new(
             SaveFailureKind::TemporaryWrite,
@@ -400,12 +440,7 @@ fn persist_prior_version(
     baseline_hash: &str,
     bytes: &[u8],
 ) -> io::Result<PathBuf> {
-    let hash_prefix = baseline_hash.get(..12).unwrap_or(baseline_hash);
-    let prior_path = recovery_directory.join(format!(
-        "{}.{}.previous",
-        safe_file_component(target),
-        hash_prefix
-    ));
+    let prior_path = recovery_directory.join(recovery_file_name(target, baseline_hash, "previous"));
     write_synced(&prior_path, bytes, false)?;
     Ok(prior_path)
 }
@@ -633,6 +668,15 @@ fn save_document_inner(
             draft_path: Some(draft_path.to_string_lossy().into_owned()),
             current_hash: Some(latest_hash),
         });
+    }
+
+    if let Err(error) = preserve_target_permissions(&temporary, target) {
+        let _ = fs::remove_file(&temporary);
+        return Err(SaveFailure::new(
+            SaveFailureKind::Replacement,
+            format!("Failed to preserve document permissions before replacement: {error}"),
+        )
+        .with_draft(&draft_path));
     }
 
     if injected_failure == Some(InjectedFailure::Replacement) {
@@ -872,6 +916,82 @@ mod tests {
             "# External change\n"
         );
         assert!(Path::new(failure.draft_path.as_deref().expect("recovery draft path")).is_file());
+    }
+
+    #[test]
+    fn recovery_drafts_for_same_named_documents_do_not_collide() {
+        let directory = tempdir().expect("temporary directory");
+        let recovery = directory.path().join("recovery");
+        let home_target = directory.path().join("home").join("Todo.md");
+        let work_target = directory.path().join("work").join("Todo.md");
+        fs::create_dir_all(home_target.parent().expect("home parent")).expect("home directory");
+        fs::create_dir_all(work_target.parent().expect("work parent")).expect("work directory");
+        fs::write(&home_target, "# Shared baseline\n").expect("home fixture");
+        fs::write(&work_target, "# Shared baseline\n").expect("work fixture");
+        let home_baseline = load_document(&home_target).expect("home baseline");
+        let work_baseline = load_document(&work_target).expect("work baseline");
+        assert_eq!(home_baseline.hash, work_baseline.hash);
+
+        let home_draft = retain_recovery_draft(
+            &home_target,
+            &recovery,
+            &save_request(
+                &home_baseline,
+                "# Home candidate\n",
+                DocumentAuthority::Source,
+            ),
+        )
+        .expect("home recovery draft");
+        let work_draft = retain_recovery_draft(
+            &work_target,
+            &recovery,
+            &save_request(
+                &work_baseline,
+                "# Work candidate\n",
+                DocumentAuthority::Source,
+            ),
+        )
+        .expect("work recovery draft");
+
+        assert_ne!(home_draft, work_draft);
+        assert_eq!(
+            fs::read_to_string(home_draft).expect("home draft contents"),
+            "# Home candidate\n"
+        );
+        assert_eq!(
+            fs::read_to_string(work_draft).expect("work draft contents"),
+            "# Work candidate\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replacement_preserves_unix_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("temporary directory");
+        let recovery = directory.path().join("recovery");
+        let target = directory.path().join("private.md");
+        fs::write(&target, "# Private\n").expect("fixture write");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+            .expect("set private permissions");
+        let baseline = load_document(&target).expect("baseline");
+
+        save_document(
+            &target,
+            &recovery,
+            &save_request(&baseline, "# Private revision\n", DocumentAuthority::Source),
+        )
+        .expect("atomic save");
+
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("saved metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]

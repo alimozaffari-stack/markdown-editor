@@ -148,6 +148,8 @@ test("preservation mode keeps source authority and blocks visual serialisation",
   const session = new DocumentSession(snapshot(original));
   session.setPreserveSourceFormatting(true);
 
+  assert.equal(session.currentMode, "source");
+
   const accepted = session.recordVisualEdit("# Original\n\nNormalised source\n");
 
   assert.equal(accepted, false);
