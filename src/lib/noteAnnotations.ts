@@ -158,9 +158,18 @@ export function mergeEditedContentIntoSource(
   let cleanOffset = 0;
   let inserted = false;
   let merged = "";
+  let remainingContentSegments = parsed.segments.filter(
+    (segment) => segment.kind === "content",
+  ).length;
 
   for (const segment of parsed.segments) {
-    if (!inserted && cleanOffset === change.from) {
+    if (segment.kind === "content") remainingContentSegments -= 1;
+    const hasLaterContent = remainingContentSegments > 0;
+    if (
+      !inserted &&
+      cleanOffset === change.from &&
+      (segment.kind === "content" || !hasLaterContent)
+    ) {
       merged += change.inserted;
       inserted = true;
     }
@@ -181,7 +190,7 @@ export function mergeEditedContentIntoSource(
     if (
       !inserted &&
       change.from >= segmentStart &&
-      change.from <= segmentEnd
+      change.from < segmentEnd
     ) {
       merged += change.inserted;
       inserted = true;

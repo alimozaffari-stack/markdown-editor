@@ -430,6 +430,43 @@ fn preserve_target_permissions(temporary: &Path, target: &Path) -> io::Result<()
     File::open(temporary)?.sync_all()
 }
 
+fn has_multiple_hard_links(target: &Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(target)?;
+        Ok(metadata.nlink() > 1)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileStandardInfo, GetFileInformationByHandleEx, FILE_STANDARD_INFO,
+        };
+
+        let file = File::open(target)?;
+        let mut information = FILE_STANDARD_INFO::default();
+        let result = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle() as _,
+                FileStandardInfo,
+                (&mut information as *mut FILE_STANDARD_INFO).cast(),
+                std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        };
+        if result == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(information.NumberOfLinks > 1)
+        }
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = target;
+        Ok(false)
+    }
+}
+
 fn persist_recovery_draft(
     recovery_directory: &Path,
     target: &Path,
@@ -665,6 +702,21 @@ fn save_document_inner(
         &request.baseline_hash,
         &encoded_candidate,
     )?;
+
+    let multiply_linked = has_multiple_hard_links(target).map_err(|error| {
+        SaveFailure::new(
+            SaveFailureKind::Io,
+            format!("Failed to inspect document links before replacement: {error}"),
+        )
+        .with_draft(&draft_path)
+    })?;
+    if multiply_linked {
+        return Err(SaveFailure::new(
+            SaveFailureKind::Replacement,
+            "The document has multiple hard links; saving was blocked to preserve the shared file relationship",
+        )
+        .with_draft(&draft_path));
+    }
 
     if injected_failure == Some(InjectedFailure::TemporaryWrite) {
         return Err(SaveFailure::new(
@@ -1215,6 +1267,46 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&actual).expect("linked target contents"),
             "# Linked revision\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_rejects_multiply_linked_documents_and_retains_the_draft() {
+        let directory = tempdir().expect("temporary directory");
+        let recovery = directory.path().join("recovery");
+        let target = directory.path().join("linked.md");
+        let alias = directory.path().join("alias.md");
+        fs::write(&target, "# Shared inode\n").expect("fixture write");
+        fs::hard_link(&target, &alias).expect("hard-link fixture");
+        let baseline = load_document(&target).expect("baseline");
+
+        let failure = save_document(
+            &target,
+            &recovery,
+            &save_request(&baseline, "# Candidate revision\n", DocumentAuthority::Source),
+        )
+        .expect_err("multiply linked documents must not be replaced");
+
+        assert_eq!(failure.kind, SaveFailureKind::Replacement);
+        assert!(failure.message.contains("multiple hard links"));
+        assert_eq!(
+            fs::read_to_string(&target).expect("target contents"),
+            "# Shared inode\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&alias).expect("alias contents"),
+            "# Shared inode\n"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                failure
+                    .draft_path
+                    .as_deref()
+                    .expect("retained draft path"),
+            )
+            .expect("draft contents"),
+            "# Candidate revision\n"
         );
     }
 

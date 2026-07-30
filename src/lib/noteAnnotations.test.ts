@@ -75,3 +75,17 @@ test("content spanning an annotation can change without deleting the annotation"
   assert.ok(merged.includes("[^1]: Exact  footnote\r\n"));
   assert.ok(merged.includes("<!-- SCRATCH_COMMENTS\r\n"));
 });
+
+test("a boundary insertion stays after the hidden annotation", () => {
+  const source = "Before\n[^1]: note\nAfter\n";
+  const parsed = parseNoteAnnotations(source);
+  const edited = parsed.cleanContent.replace(
+    "After",
+    "# Inserted heading\nAfter",
+  );
+
+  assert.equal(
+    mergeEditedContentIntoSource(source, parsed.cleanContent, edited),
+    "Before\n[^1]: note\n# Inserted heading\nAfter\n",
+  );
+});
