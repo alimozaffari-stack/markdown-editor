@@ -2106,6 +2106,11 @@ async fn retain_file_recovery_draft(
     Ok(draft_path.to_string_lossy().into_owned())
 }
 
+fn load_import_source_content(source: &Path) -> Result<String, String> {
+    document::load_document_content(source)
+        .map_err(|error| format!("Failed to read source file: {}", error.message))
+}
+
 #[tauri::command]
 async fn import_file_to_folder(app: AppHandle, path: String) -> Result<NoteMetadata, String> {
     let source = validate_preview_path(&path)?;
@@ -2123,10 +2128,8 @@ async fn import_file_to_folder(app: AppHandle, path: String) -> Result<NoteMetad
     };
     let folder_path = PathBuf::from(&folder);
 
-    // Read the source file content
-    let content = fs::read_to_string(&source)
-        .await
-        .map_err(|_| "Failed to read source file".to_string())?;
+    // Use the same BOM-aware decoder as preview and managed-note discovery.
+    let content = load_import_source_content(&source)?;
 
     // Derive the note ID from the title (H1 heading), falling back to filename
     let extracted_title = extract_title(&content);
@@ -2211,6 +2214,35 @@ async fn import_file_to_folder(app: AppHandle, path: String) -> Result<NoteMetad
     }
 
     Ok(metadata)
+}
+
+#[cfg(test)]
+mod import_source_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn utf16le_bytes(content: &str) -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xfe];
+        for code_unit in content.encode_utf16() {
+            bytes.extend_from_slice(&code_unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn import_source_loader_decodes_bom_marked_utf16() {
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("external.md");
+        std::fs::write(
+            &source,
+            utf16le_bytes("# Imported UTF-16\n\nExact source ✓\n"),
+        )
+        .expect("UTF-16 fixture");
+
+        let content = load_import_source_content(&source).expect("decoded import source");
+
+        assert_eq!(content, "# Imported UTF-16\n\nExact source ✓\n");
+    }
 }
 
 #[tauri::command]
