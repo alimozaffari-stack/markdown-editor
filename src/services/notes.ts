@@ -1,5 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Note, NoteMetadata, Settings } from "../types/note";
+import type {
+  DocumentAuthority,
+  DocumentSaveRequest,
+  DocumentSnapshot,
+} from "../lib/documentLifecycle";
 
 export async function getNotesFolder(): Promise<string | null> {
   return invoke("get_notes_folder");
@@ -17,8 +22,35 @@ export async function readNote(id: string): Promise<Note> {
   return invoke("read_note", { id });
 }
 
-export async function saveNote(id: string | null, content: string): Promise<Note> {
-  return invoke("save_note", { id, content });
+export async function saveNote(
+  id: string,
+  request: DocumentSaveRequest,
+): Promise<Note> {
+  return invoke("save_note", { id, request });
+}
+
+export async function retainNoteRecoveryDraft(
+  id: string,
+  request: DocumentSaveRequest,
+): Promise<string> {
+  return invoke("retain_note_recovery_draft", { id, request });
+}
+
+export function createSaveRequest(
+  snapshot: DocumentSnapshot,
+  content: string,
+  authority: DocumentAuthority = "source",
+): DocumentSaveRequest {
+  return {
+    content,
+    baselineHash: snapshot.hash,
+    revision: snapshot.revision,
+    encoding: snapshot.encoding,
+    bom: snapshot.bom,
+    lineEnding: snapshot.lineEnding,
+    authority,
+    reason: "explicit",
+  };
 }
 
 export async function deleteNote(id: string): Promise<void> {
@@ -61,7 +93,13 @@ export async function duplicateNote(id: string): Promise<Note> {
   const newNote = await createNote(folder);
   // Save with the original content (title will be extracted from content)
   const duplicatedContent = original.content.replace(/^# (.+)$/m, (_, title) => `# ${title} (Copy)`);
-  return saveNote(newNote.id, duplicatedContent || original.content);
+  return saveNote(
+    newNote.id,
+    createSaveRequest(
+      newNote.snapshot,
+      duplicatedContent || original.content,
+    ),
+  );
 }
 
 export async function getSettings(): Promise<Settings> {

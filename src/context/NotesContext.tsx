@@ -14,9 +14,16 @@ import type { Note, NoteMetadata, Comment, Footnote, SortOption } from "../types
 import { recordCreationDate } from "../lib/utils";
 import * as notesService from "../services/notes";
 import type { SearchResult } from "../services/notes";
+import type { DocumentSaveRequest } from "../lib/documentLifecycle";
+import {
+  mergeEditedContentIntoSource,
+  parseNoteAnnotations,
+} from "../lib/noteAnnotations";
 
 export function extractComments(content: string): { cleanContent: string; comments: Comment[] } {
-  const match = content.match(/\r?\n\r?\n?<!-- SCRATCH_COMMENTS\n([\s\S]*?)\n-->$/);
+  const match = content.match(
+    /(?:\r?\n){1,2}<!-- SCRATCH_COMMENTS\r?\n([\s\S]*?)\r?\n-->$/,
+  );
   if (match) {
     try {
       const comments = JSON.parse(match[1]);
@@ -31,15 +38,21 @@ export function extractComments(content: string): { cleanContent: string; commen
 
 export function appendComments(content: string, comments: Comment[]): string {
   if (!comments || comments.length === 0) return content;
-  return `${content.trim()}\n\n<!-- SCRATCH_COMMENTS\n${JSON.stringify(comments, null, 2)}\n-->`;
+  const lineEnding = content.includes("\r\n") ? "\r\n" : "\n";
+  const separator = content.endsWith(lineEnding)
+    ? lineEnding
+    : `${lineEnding}${lineEnding}`;
+  return `${content}${separator}<!-- SCRATCH_COMMENTS${lineEnding}${JSON.stringify(comments, null, 2).replace(/\n/g, lineEnding)}${lineEnding}-->`;
 }
 
 export function extractFootnotes(content: string): { cleanContent: string; footnotes: Footnote[] } {
   const footnotes: Footnote[] = [];
-  const lines = content.split(/\r?\n/);
-  const cleanLines: string[] = [];
-  
-  for (const line of lines) {
+  const segments = content.match(/[^\r\n]*(?:\r\n|\r|\n|$)/g) ?? [];
+  const cleanSegments: string[] = [];
+
+  for (const segment of segments) {
+    if (!segment) continue;
+    const line = segment.replace(/(?:\r\n|\r|\n)$/, "");
     const match = line.match(/^\[\^([^\]]+)\]:\s*(.*)$/);
     if (match) {
       footnotes.push({
@@ -47,18 +60,79 @@ export function extractFootnotes(content: string): { cleanContent: string; footn
         text: match[2].trim()
       });
     } else {
-      cleanLines.push(line);
+      cleanSegments.push(segment);
     }
   }
-  
-  const cleanContent = cleanLines.join("\n").trim();
-  return { cleanContent, footnotes };
+
+  return { cleanContent: cleanSegments.join(""), footnotes };
 }
 
 export function appendFootnotes(content: string, footnotes: Footnote[]): string {
   if (!footnotes || footnotes.length === 0) return content;
-  const footnoteLines = footnotes.map(f => `[^${f.id}]: ${f.text}`).join("\n");
-  return `${content.trim()}\n\n${footnoteLines}`;
+  const lineEnding = content.includes("\r\n") ? "\r\n" : "\n";
+  const separator = content.endsWith(lineEnding)
+    ? lineEnding
+    : `${lineEnding}${lineEnding}`;
+  const footnoteLines = footnotes
+    .map(f => `[^${f.id}]: ${f.text}`)
+    .join(lineEnding);
+  return `${content}${separator}${footnoteLines}`;
+}
+
+function prepareNoteForEditing(note: Note): {
+  note: Note;
+  comments: Comment[];
+  footnotes: Footnote[];
+} {
+  const parsed = parseNoteAnnotations(note.content);
+  const sourceContent =
+    parsed.cleanContent === note.content ? undefined : note.content;
+  return {
+    note: {
+      ...note,
+      content: parsed.cleanContent,
+      snapshot: {
+        ...note.snapshot,
+        content: parsed.cleanContent,
+        ...(sourceContent === undefined ? {} : { sourceContent }),
+      },
+    },
+    comments: parsed.comments,
+    footnotes: parsed.footnotes,
+  };
+}
+
+function prepareStorageSaveRequest(
+  request: DocumentSaveRequest,
+  footnotes: Footnote[],
+  comments: Comment[],
+): DocumentSaveRequest {
+  const {
+    content,
+    contentBaseline,
+    sourceBaseline,
+    contentIsStorageSource,
+    ...requestMetadata
+  } = request;
+  let storageContent = content;
+  if (
+    !contentIsStorageSource &&
+    contentBaseline !== undefined &&
+    sourceBaseline !== undefined
+  ) {
+    storageContent = mergeEditedContentIntoSource(
+      sourceBaseline,
+      contentBaseline,
+      content,
+    );
+  } else if (!contentIsStorageSource) {
+    storageContent = appendComments(
+      appendFootnotes(content, footnotes),
+      comments,
+    );
+  }
+
+  return { ...requestMetadata, content: storageContent };
 }
 
 // Separate contexts to prevent unnecessary re-renders
@@ -87,7 +161,14 @@ interface NotesActionsContextValue {
   selectNote: (id: string) => Promise<void>;
   createNote: () => Promise<void>;
   consumePendingNewNote: (id: string) => boolean;
-  saveNote: (content: string, noteId?: string) => Promise<void>;
+  saveNote: (
+    request: DocumentSaveRequest,
+    noteId?: string,
+  ) => Promise<Note | null>;
+  retainRecoveryDraft: (
+    request: DocumentSaveRequest,
+    noteId?: string,
+  ) => Promise<string>;
   deleteNote: (id: string) => Promise<void>;
   duplicateNote: (id: string) => Promise<void>;
   refreshNotes: () => Promise<void>;
@@ -220,11 +301,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       }
       const note = await notesService.readNote(id);
       if (requestId !== selectRequestIdRef.current) return;
-      const { cleanContent: contentWithoutFootnotes, footnotes } = extractFootnotes(note.content);
-      const { cleanContent, comments } = extractComments(contentWithoutFootnotes);
-      setFootnotesMap((prev) => ({ ...prev, [id]: footnotes }));
-      setCommentsMap((prev) => ({ ...prev, [id]: comments }));
-      setCurrentNote({ ...note, content: cleanContent });
+      const prepared = prepareNoteForEditing(note);
+      setFootnotesMap((prev) => ({
+        ...prev,
+        [id]: prepared.footnotes,
+      }));
+      setCommentsMap((prev) => ({
+        ...prev,
+        [id]: prepared.comments,
+      }));
+      setCurrentNote(prepared.note);
     } catch (err) {
       if (requestId !== selectRequestIdRef.current) return;
       setError(err instanceof Error ? err.message : "Failed to load note");
@@ -235,11 +321,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     if (!selectedNoteIdRef.current) return;
     try {
       const note = await notesService.readNote(selectedNoteIdRef.current);
-      const { cleanContent: contentWithoutFootnotes, footnotes } = extractFootnotes(note.content);
-      const { cleanContent, comments } = extractComments(contentWithoutFootnotes);
-      setFootnotesMap((prev) => ({ ...prev, [selectedNoteIdRef.current!]: footnotes }));
-      setCommentsMap((prev) => ({ ...prev, [selectedNoteIdRef.current!]: comments }));
-      setCurrentNote({ ...note, content: cleanContent });
+      const prepared = prepareNoteForEditing(note);
+      setFootnotesMap((prev) => ({
+        ...prev,
+        [selectedNoteIdRef.current!]: prepared.footnotes,
+      }));
+      setCommentsMap((prev) => ({
+        ...prev,
+        [selectedNoteIdRef.current!]: prepared.comments,
+      }));
+      setCurrentNote(prepared.note);
       setHasExternalChanges(false);
       setReloadVersion((v) => v + 1);
     } catch (err) {
@@ -287,44 +378,31 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const saveNote = useCallback(
-    async (content: string, noteId?: string) => {
+    async (request: DocumentSaveRequest, noteId?: string) => {
       // Use provided noteId (for flush saves) or fall back to currentNote.id
       const savingNoteId = noteId || currentNote?.id;
-      if (!savingNoteId) return;
+      if (!savingNoteId) return null;
       let updatedId: string | null = null;
 
       try {
         // Mark this note as recently saved to ignore file-change events from our own save
         recentlySavedRef.current.add(savingNoteId);
 
-        // Append footnotes and comments to the saving content
-        const footnotes = footnotesMapRef.current[savingNoteId] || [];
-        const contentWithFootnotes = appendFootnotes(content, footnotes);
-        const comments = commentsMapRef.current[savingNoteId] || [];
-        const contentWithComments = appendComments(contentWithFootnotes, comments);
-
-        const updated = await notesService.saveNote(savingNoteId, contentWithComments);
+        const storageRequest = prepareStorageSaveRequest(
+          request,
+          footnotesMapRef.current[savingNoteId] || [],
+          commentsMapRef.current[savingNoteId] || [],
+        );
+        const updated = await notesService.saveNote(
+          savingNoteId,
+          storageRequest,
+        );
+        const prepared = prepareNoteForEditing(updated);
         updatedId = updated.id;
 
         // If the note was renamed (ID changed), also mark the new ID
         if (updated.id !== savingNoteId) {
           recentlySavedRef.current.add(updated.id);
-
-          // Transfer comments to the new ID
-          setCommentsMap((prev) => {
-            const next = { ...prev };
-            next[updated.id] = next[savingNoteId] || [];
-            delete next[savingNoteId];
-            return next;
-          });
-
-          // Transfer footnotes to the new ID
-          setFootnotesMap((prev) => {
-            const next = { ...prev };
-            next[updated.id] = next[savingNoteId] || [];
-            delete next[savingNoteId];
-            return next;
-          });
 
           // Transfer pin status to new ID
           const currentSettings = await notesService.getSettings();
@@ -339,6 +417,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
             await notesService.updateSettings(updatedSettings);
           }
         }
+        setCommentsMap((prev) => {
+          const next = { ...prev, [updated.id]: prepared.comments };
+          if (updated.id !== savingNoteId) delete next[savingNoteId];
+          return next;
+        });
+        setFootnotesMap((prev) => {
+          const next = { ...prev, [updated.id]: prepared.footnotes };
+          if (updated.id !== savingNoteId) delete next[savingNoteId];
+          return next;
+        });
 
         // Clear external changes flag - if it was set by our own save, we want to ignore it
         setHasExternalChanges(false);
@@ -348,9 +436,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         setSelectedNoteId((prevId) => {
           if (prevId === savingNoteId) {
             // Update to the new ID if the note was renamed
-            const { cleanContent: contentWithoutFootnotes } = extractFootnotes(updated.content);
-            const { cleanContent } = extractComments(contentWithoutFootnotes);
-            setCurrentNote({ ...updated, content: cleanContent });
+            setCurrentNote(prepared.note);
             return updated.id;
           }
           // User switched to a different note, don't update current note
@@ -366,14 +452,35 @@ export function NotesProvider({ children }: { children: ReactNode }) {
           recentlySavedRef.current.delete(savingNoteId);
           if (updatedId) recentlySavedRef.current.delete(updatedId);
         }, 1000);
+        return prepared.note;
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to save note");
         // Clean up immediately on error to avoid leaving stale entries
         recentlySavedRef.current.delete(savingNoteId);
         if (updatedId) recentlySavedRef.current.delete(updatedId);
+        throw err;
       }
     },
     [currentNote, scheduleRefresh]
+  );
+
+  const retainRecoveryDraft = useCallback(
+    async (request: DocumentSaveRequest, noteId?: string) => {
+      const savingNoteId = noteId || currentNote?.id;
+      if (!savingNoteId) {
+        throw new Error("No note is selected");
+      }
+      const storageRequest = prepareStorageSaveRequest(
+        request,
+        footnotesMapRef.current[savingNoteId] || [],
+        commentsMapRef.current[savingNoteId] || [],
+      );
+      return notesService.retainNoteRecoveryDraft(
+        savingNoteId,
+        storageRequest,
+      );
+    },
+    [currentNote],
   );
 
   const deleteNote = useCallback(
@@ -384,10 +491,15 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         // Clean up pinned status for deleted note
         const currentSettings = await notesService.getSettings();
         const pinnedIds = currentSettings.pinnedNoteIds || [];
-        if (pinnedIds.includes(id)) {
+        const protectedIds =
+          currentSettings.preserveSourceFormattingNoteIds || [];
+        if (pinnedIds.includes(id) || protectedIds.includes(id)) {
           const updatedSettings = {
             ...currentSettings,
             pinnedNoteIds: pinnedIds.filter((pinId) => pinId !== id),
+            preserveSourceFormattingNoteIds: protectedIds.filter(
+              (noteId) => noteId !== id,
+            ),
           };
           await notesService.updateSettings(updatedSettings);
         }
@@ -469,6 +581,35 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     [refreshNotes]
   );
 
+  const persistAnnotations = useCallback(
+    async (
+      noteId: string,
+      footnotes: Footnote[],
+      comments: Comment[],
+    ) => {
+      const loaded =
+        currentNoteRef.current?.id === noteId
+          ? currentNoteRef.current
+          : prepareNoteForEditing(await notesService.readNote(noteId)).note;
+      if (!loaded) return;
+      const storageContent = appendComments(
+        appendFootnotes(loaded.content, footnotes),
+        comments,
+      );
+      await saveNote(
+        {
+          ...notesService.createSaveRequest(
+            loaded.snapshot,
+            storageContent,
+          ),
+          contentIsStorageSource: true,
+        },
+        noteId,
+      );
+    },
+    [saveNote],
+  );
+
   const addComment = useCallback(
     async (noteId: string, text: string) => {
       const newComment: Comment = {
@@ -476,146 +617,101 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         text,
         timestamp: Math.floor(Date.now() / 1000),
       };
-
-      setCommentsMap((prev) => {
-        const currentComments = prev[noteId] || [];
-        const updatedComments = [...currentComments, newComment];
-        const currentFootnotes = footnotesMapRef.current[noteId] || [];
-
-        if (currentNoteRef.current && currentNoteRef.current.id === noteId) {
-          const contentWithFootnotes = appendFootnotes(currentNoteRef.current.content, currentFootnotes);
-          const contentWithComments = appendComments(contentWithFootnotes, updatedComments);
-          notesService.saveNote(noteId, contentWithComments).catch(console.error);
-        } else {
-          notesService.readNote(noteId).then((note) => {
-            const { cleanContent: contentWithoutFootnotes, footnotes: parsedFootnotes } = extractFootnotes(note.content);
-            const { cleanContent } = extractComments(contentWithoutFootnotes);
-            const contentWithFootnotes = appendFootnotes(cleanContent, parsedFootnotes);
-            const contentWithComments = appendComments(contentWithFootnotes, updatedComments);
-            notesService.saveNote(noteId, contentWithComments).catch(console.error);
-          });
-        }
-
-        return { ...prev, [noteId]: updatedComments };
-      });
+      const updatedComments = [
+        ...(commentsMapRef.current[noteId] || []),
+        newComment,
+      ];
+      setCommentsMap((prev) => ({
+        ...prev,
+        [noteId]: updatedComments,
+      }));
+      await persistAnnotations(
+        noteId,
+        footnotesMapRef.current[noteId] || [],
+        updatedComments,
+      );
     },
-    []
+    [persistAnnotations],
   );
 
   const deleteComment = useCallback(
     async (noteId: string, commentId: string) => {
-      setCommentsMap((prev) => {
-        const currentComments = prev[noteId] || [];
-        const updatedComments = currentComments.filter((c) => c.id !== commentId);
-        const currentFootnotes = footnotesMapRef.current[noteId] || [];
-
-        if (currentNoteRef.current && currentNoteRef.current.id === noteId) {
-          const contentWithFootnotes = appendFootnotes(currentNoteRef.current.content, currentFootnotes);
-          const contentWithComments = appendComments(contentWithFootnotes, updatedComments);
-          notesService.saveNote(noteId, contentWithComments).catch(console.error);
-        } else {
-          notesService.readNote(noteId).then((note) => {
-            const { cleanContent: contentWithoutFootnotes, footnotes: parsedFootnotes } = extractFootnotes(note.content);
-            const { cleanContent } = extractComments(contentWithoutFootnotes);
-            const contentWithFootnotes = appendFootnotes(cleanContent, parsedFootnotes);
-            const contentWithComments = appendComments(contentWithFootnotes, updatedComments);
-            notesService.saveNote(noteId, contentWithComments).catch(console.error);
-          });
-        }
-
-        return { ...prev, [noteId]: updatedComments };
-      });
+      const updatedComments = (
+        commentsMapRef.current[noteId] || []
+      ).filter((comment) => comment.id !== commentId);
+      setCommentsMap((prev) => ({
+        ...prev,
+        [noteId]: updatedComments,
+      }));
+      await persistAnnotations(
+        noteId,
+        footnotesMapRef.current[noteId] || [],
+        updatedComments,
+      );
     },
-    []
+    [persistAnnotations],
   );
 
   const addFootnote = useCallback(
     async (noteId: string, id: string, text: string) => {
-      setFootnotesMap((prev) => {
-        const currentFootnotes = prev[noteId] || [];
-        const exists = currentFootnotes.some((f) => f.id === id);
-        const updatedFootnotes = exists
-          ? currentFootnotes.map((f) => (f.id === id ? { ...f, text } : f))
-          : [...currentFootnotes, { id, text }];
-
-        const currentComments = commentsMapRef.current[noteId] || [];
-
-        if (currentNoteRef.current && currentNoteRef.current.id === noteId) {
-          const contentWithFootnotes = appendFootnotes(currentNoteRef.current.content, updatedFootnotes);
-          const contentWithComments = appendComments(contentWithFootnotes, currentComments);
-          notesService.saveNote(noteId, contentWithComments).catch(console.error);
-        } else {
-          notesService.readNote(noteId).then((note) => {
-            const { cleanContent: contentWithoutFootnotes } = extractFootnotes(note.content);
-            const { cleanContent } = extractComments(contentWithoutFootnotes);
-            const contentWithFootnotes = appendFootnotes(cleanContent, updatedFootnotes);
-            const contentWithComments = appendComments(contentWithFootnotes, currentComments);
-            notesService.saveNote(noteId, contentWithComments).catch(console.error);
-          });
-        }
-
-        return { ...prev, [noteId]: updatedFootnotes };
-      });
+      const currentFootnotes = footnotesMapRef.current[noteId] || [];
+      const exists = currentFootnotes.some(
+        (footnote) => footnote.id === id,
+      );
+      const updatedFootnotes = exists
+        ? currentFootnotes.map((footnote) =>
+            footnote.id === id ? { ...footnote, text } : footnote,
+          )
+        : [...currentFootnotes, { id, text }];
+      setFootnotesMap((prev) => ({
+        ...prev,
+        [noteId]: updatedFootnotes,
+      }));
+      await persistAnnotations(
+        noteId,
+        updatedFootnotes,
+        commentsMapRef.current[noteId] || [],
+      );
     },
-    []
+    [persistAnnotations],
   );
 
   const updateFootnote = useCallback(
     async (noteId: string, id: string, text: string) => {
-      setFootnotesMap((prev) => {
-        const currentFootnotes = prev[noteId] || [];
-        const updatedFootnotes = currentFootnotes.map((f) =>
-          f.id === id ? { ...f, text } : f
-        );
-
-        const currentComments = commentsMapRef.current[noteId] || [];
-
-        if (currentNoteRef.current && currentNoteRef.current.id === noteId) {
-          const contentWithFootnotes = appendFootnotes(currentNoteRef.current.content, updatedFootnotes);
-          const contentWithComments = appendComments(contentWithFootnotes, currentComments);
-          notesService.saveNote(noteId, contentWithComments).catch(console.error);
-        } else {
-          notesService.readNote(noteId).then((note) => {
-            const { cleanContent: contentWithoutFootnotes } = extractFootnotes(note.content);
-            const { cleanContent } = extractComments(contentWithoutFootnotes);
-            const contentWithFootnotesActual = appendFootnotes(cleanContent, updatedFootnotes);
-            const contentWithComments = appendComments(contentWithFootnotesActual, currentComments);
-            notesService.saveNote(noteId, contentWithComments).catch(console.error);
-          });
-        }
-
-        return { ...prev, [noteId]: updatedFootnotes };
-      });
+      const updatedFootnotes = (
+        footnotesMapRef.current[noteId] || []
+      ).map((footnote) =>
+        footnote.id === id ? { ...footnote, text } : footnote,
+      );
+      setFootnotesMap((prev) => ({
+        ...prev,
+        [noteId]: updatedFootnotes,
+      }));
+      await persistAnnotations(
+        noteId,
+        updatedFootnotes,
+        commentsMapRef.current[noteId] || [],
+      );
     },
-    []
+    [persistAnnotations],
   );
 
   const deleteFootnote = useCallback(
     async (noteId: string, id: string) => {
-      setFootnotesMap((prev) => {
-        const currentFootnotes = prev[noteId] || [];
-        const updatedFootnotes = currentFootnotes.filter((f) => f.id !== id);
-
-        const currentComments = commentsMapRef.current[noteId] || [];
-
-        if (currentNoteRef.current && currentNoteRef.current.id === noteId) {
-          const contentWithFootnotes = appendFootnotes(currentNoteRef.current.content, updatedFootnotes);
-          const contentWithComments = appendComments(contentWithFootnotes, currentComments);
-          notesService.saveNote(noteId, contentWithComments).catch(console.error);
-        } else {
-          notesService.readNote(noteId).then((note) => {
-            const { cleanContent: contentWithoutFootnotes } = extractFootnotes(note.content);
-            const { cleanContent } = extractComments(contentWithoutFootnotes);
-            const contentWithFootnotes = appendFootnotes(cleanContent, updatedFootnotes);
-            const contentWithComments = appendComments(contentWithFootnotes, currentComments);
-            notesService.saveNote(noteId, contentWithComments).catch(console.error);
-          });
-        }
-
-        return { ...prev, [noteId]: updatedFootnotes };
-      });
+      const updatedFootnotes = (
+        footnotesMapRef.current[noteId] || []
+      ).filter((footnote) => footnote.id !== id);
+      setFootnotesMap((prev) => ({
+        ...prev,
+        [noteId]: updatedFootnotes,
+      }));
+      await persistAnnotations(
+        noteId,
+        updatedFootnotes,
+        commentsMapRef.current[noteId] || [],
+      );
     },
-    []
+    [persistAnnotations],
   );
 
   const createNoteInFolder = useCallback(
@@ -1028,6 +1124,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       createNote,
       consumePendingNewNote,
       saveNote,
+      retainRecoveryDraft,
       deleteNote,
       duplicateNote,
       refreshNotes,
@@ -1057,6 +1154,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       createNote,
       consumePendingNewNote,
       saveNote,
+      retainRecoveryDraft,
       deleteNote,
       duplicateNote,
       refreshNotes,

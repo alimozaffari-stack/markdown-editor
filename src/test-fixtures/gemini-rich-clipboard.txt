@@ -1,0 +1,4 @@
+Heritage–Border Research WorkflowThis workflow preserves evidence, hierarchy and sequence.Phase A: Source review1. Map the source corpus.2. Verify quotations and locators.Phase B: Analysis• Compare claims.• Retain methodological cautions.{
+  "workflow_module": "Module_08_Book_Chapter_Contribution",
+  "output_artifact": "Verified chapter"
+}

@@ -12,21 +12,14 @@ import {
   ReactNodeViewRenderer,
   type Editor as TiptapEditor,
 } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
 import Link from "@tiptap/extension-link";
-import Image from "@tiptap/extension-image";
-import TaskList from "@tiptap/extension-task-list";
-import TaskItem from "@tiptap/extension-task-item";
-import Highlight from "@tiptap/extension-highlight";
-import { TextStyle } from "@tiptap/extension-text-style";
-import { Color } from "@tiptap/extension-color";
 import { TableKit } from "@tiptap/extension-table";
 import { Markdown } from "@tiptap/markdown";
 import CodeBlockLowlight from "@tiptap/extension-code-block-lowlight";
 import { lowlight } from "./lowlight";
 import { CodeBlockView } from "./CodeBlockView";
-import { Extension, InputRule } from "@tiptap/core";
+import { Extension, InputRule, type JSONContent } from "@tiptap/core";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import { DOMSerializer } from "@tiptap/pm/model";
 import { marked } from "marked";
@@ -35,7 +28,27 @@ import {
   formatAllTablesInMarkdown,
   repairMarkdownText,
 } from "../../lib/markdownFormatter";
-import { prepareMarkdownPaste } from "../../lib/markdownPaste";
+import {
+  parseClipboardHtmlPreservingContent,
+  performClipboardPaste,
+  findClipboardImageItem,
+  readClipboardPayload,
+  type ClipboardInsertionAdapter,
+  type ClipboardPayload,
+} from "../../lib/clipboardTranslation";
+import {
+  DocumentSession,
+  toSourceEditorText,
+  type DocumentSaveFailure,
+  type DocumentSaveReason,
+  type DocumentSaveRequest,
+  type DocumentSnapshot,
+} from "../../lib/documentLifecycle";
+import {
+  parseMarkdownPreservingContent,
+  validateMarkdownRoundTrip,
+} from "../../lib/markdownConversion";
+import { createMarkdownSchemaExtensions } from "../../lib/markdownExtensions";
 import {
   NodeSelection,
   Plugin,
@@ -72,17 +85,14 @@ import * as AlertDialog from "@radix-ui/react-alert-dialog";
 import { Menu, MenuItem, PredefinedMenuItem } from "@tauri-apps/api/menu";
 import { useOptionalNotes, extractComments } from "../../context/NotesContext";
 import { useTheme } from "../../context/ThemeContext";
-import { Frontmatter } from "./Frontmatter";
 import { BlockMathEditor } from "./BlockMathEditor";
 import { LinkEditor } from "./LinkEditor";
 import { SearchToolbar } from "./SearchToolbar";
 import { SlashCommand } from "./SlashCommand";
-import { Wikilink, type WikilinkStorage } from "./Wikilink";
+import { type WikilinkStorage } from "./Wikilink";
 import { WikilinkSuggestion } from "./WikilinkSuggestion";
-import { FootnoteReference } from "./FootnoteReference";
 import { EditorWidthHandles } from "./EditorWidthHandle";
 import { ScratchBlockMath, normalizeBlockMath } from "./MathExtensions";
-import { CollapsibleHeadings } from "./CollapsibleHeadings";
 import { TableOfContents } from "./TableOfContents";
 import { cn } from "../../lib/utils";
 import { plainTextFromMarkdown } from "../../lib/plainText";
@@ -151,6 +161,31 @@ type FormattingPreview = {
   proposed: string;
   sourceMode: boolean;
 };
+
+function describeSaveFailure(error: unknown): DocumentSaveFailure {
+  if (error && typeof error === "object") {
+    const candidate = error as Partial<DocumentSaveFailure>;
+    if (typeof candidate.kind === "string" && typeof candidate.message === "string") {
+      return {
+        kind: candidate.kind as DocumentSaveFailure["kind"],
+        message: candidate.message,
+        draftPath: candidate.draftPath,
+        currentHash: candidate.currentHash,
+      };
+    }
+  }
+  return {
+    kind: "io",
+    message: error instanceof Error ? error.message : String(error),
+  };
+}
+
+function literalTextContent(text: string): JSONContent[] {
+  return text.replace(/\r\n?/g, "\n").split("\n").map((line) => ({
+    type: "paragraph",
+    content: line ? [{ type: "text", text: line }] : undefined,
+  }));
+}
 
 function focusAndSelectTitle(editor: TiptapEditor): boolean {
   let titleFrom = -1;
@@ -578,9 +613,11 @@ export interface PreviewModeData {
   title: string;
   filePath: string;
   modified: number;
+  snapshot: DocumentSnapshot | null;
   hasExternalChanges: boolean;
   reloadVersion: number;
-  save: (content: string) => Promise<void>;
+  save: (request: DocumentSaveRequest) => Promise<DocumentSnapshot>;
+  retainRecoveryDraft: (request: DocumentSaveRequest) => Promise<string>;
   reload: () => Promise<void>;
 }
 
@@ -660,22 +697,32 @@ export function Editor({
   const notesCtx = useOptionalNotes();
 
   const currentNote = previewMode
-    ? previewMode.content !== null
+    ? previewMode.content !== null && previewMode.snapshot
       ? {
           id: previewMode.filePath,
           title: previewMode.title,
           content: previewMode.content,
           path: previewMode.filePath,
           modified: previewMode.modified,
+          snapshot: previewMode.snapshot,
         }
       : null
     : (notesCtx?.currentNote ?? null);
 
-  const saveNote = previewMode
-    ? async (content: string, _noteId?: string) => {
-        await previewMode.save(content);
+  const saveDocument = previewMode
+    ? async (request: DocumentSaveRequest, _noteId?: string) => {
+        return previewMode.save(request);
       }
-    : notesCtx!.saveNote;
+    : async (request: DocumentSaveRequest, noteId?: string) => {
+        const note = await notesCtx!.saveNote(request, noteId);
+        if (!note) throw new Error("No note is selected");
+        return note.snapshot;
+      };
+  const retainRecoveryDraft = previewMode
+    ? async (request: DocumentSaveRequest, _noteId?: string) =>
+        previewMode.retainRecoveryDraft(request)
+    : async (request: DocumentSaveRequest, noteId?: string) =>
+        notesCtx!.retainRecoveryDraft(request, noteId);
 
   const createNote = notesCtx?.createNote;
   const consumePendingNewNote = notesCtx?.consumePendingNewNote;
@@ -698,6 +745,8 @@ export function Editor({
   const mod = isMac ? "⌘" : "Ctrl";
   const [isSaving, setIsSaving] = useState(false);
   const [isUnsaved, setIsUnsaved] = useState(false);
+  const [saveConflict, setSaveConflict] =
+    useState<DocumentSaveFailure | null>(null);
   // Force re-render when selection changes to update toolbar active states
   const [, setSelectionKey] = useState(0);
   const [copyMenuOpen, setCopyMenuOpen] = useState(false);
@@ -706,6 +755,7 @@ export function Editor({
   const [hasTransitioned, setHasTransitioned] = useState(false);
   useEffect(() => {
     setIsUnsaved(false);
+    setSaveConflict(null);
   }, [currentNote?.id]);
 
   useEffect(() => {
@@ -750,6 +800,8 @@ export function Editor({
   const linkPopupRef = useRef<TippyInstance | null>(null);
   const blockMathPopupRef = useRef<TippyInstance | null>(null);
   const isLoadingRef = useRef(false);
+  const documentSessionRef = useRef<DocumentSession | null>(null);
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<TiptapEditor | null>(null);
   const currentNoteIdRef = useRef<string | null>(null);
@@ -796,6 +848,16 @@ export function Editor({
   // Calculate if current note is pinned
   const isPinned =
     settings?.pinnedNoteIds?.includes(currentNote?.id || "") || false;
+  const preserveSourceFormatting =
+    settings?.preserveSourceFormattingNoteIds?.includes(
+      currentNote?.id || "",
+    ) || false;
+
+  useEffect(() => {
+    documentSessionRef.current?.setPreserveSourceFormatting(
+      preserveSourceFormatting,
+    );
+  }, [preserveSourceFormatting]);
 
   // Find all matches for search query (case-insensitive)
   const findMatches = useCallback(
@@ -890,20 +952,94 @@ export function Editor({
     [],
   );
 
-  // Immediate save function (used for flushing)
+  // Every autosave and explicit save passes through the same session request.
   const saveImmediately = useCallback(
-    async (noteId: string, content: string) => {
-      setIsSaving(true);
-      try {
-        lastSaveRef.current = { noteId, content };
-        await saveNote(content, noteId);
+    (noteId: string, reason: DocumentSaveReason) => {
+      const session = documentSessionRef.current;
+      const request = session?.takeSaveRequest(reason);
+      if (!session || !request) {
         setIsUnsaved(false);
-      } finally {
-        setIsSaving(false);
+        return Promise.resolve();
       }
+
+      let validationError: Error | null = null;
+      if (request.authority === "visual" && editorRef.current) {
+        const manager = editorRef.current.storage.markdown?.manager;
+        if (manager) {
+          const validation = validateMarkdownRoundTrip(
+            manager,
+            editorRef.current.getJSON(),
+            request.content,
+          );
+          if (!validation.ok) {
+            validationError = new Error(
+              validation.reason ?? "Markdown round-trip validation failed",
+            );
+          }
+        }
+      }
+
+      const operation = async () => {
+        const isCurrentSession = () =>
+          documentSessionRef.current === session;
+        if (isCurrentSession()) setIsSaving(true);
+        try {
+          // A prior queued save may have advanced this session's baseline.
+          // Keep this request's frozen candidate while rebasing its conflict
+          // metadata onto the successfully saved snapshot.
+          const baseline = session.currentSnapshot;
+          const executableRequest: DocumentSaveRequest = {
+            ...request,
+            baselineHash: baseline.hash,
+            revision: baseline.revision,
+            encoding: baseline.encoding,
+            bom: baseline.bom,
+            lineEnding: baseline.lineEnding,
+          };
+          if (validationError) {
+            const draftPath = await retainRecoveryDraft(
+              executableRequest,
+              noteId,
+            );
+            throw {
+              kind: "validation",
+              message: validationError.message,
+              draftPath,
+            } satisfies DocumentSaveFailure;
+          }
+          const snapshot = await saveDocument(executableRequest, noteId);
+          lastSaveRef.current = { noteId, content: snapshot.content };
+          session.markSaved(snapshot, executableRequest);
+          if (isCurrentSession()) {
+            setSaveConflict(null);
+            setIsUnsaved(session.isDirty);
+          }
+        } catch (error) {
+          const failure = describeSaveFailure(error);
+          if (isCurrentSession()) {
+            if (failure.kind === "conflict") setSaveConflict(failure);
+            setIsUnsaved(true);
+          }
+          const recovery = failure.draftPath
+            ? ` Recovery draft: ${failure.draftPath}`
+            : "";
+          toast.error(`${failure.message}${recovery}`);
+        } finally {
+          if (isCurrentSession()) setIsSaving(false);
+        }
+      };
+
+      const queued = saveQueueRef.current.then(operation, operation);
+      saveQueueRef.current = queued.then(
+        () => undefined,
+        () => undefined,
+      );
+      return queued;
     },
-    [saveNote],
+    [retainRecoveryDraft, saveDocument],
   );
+  const saveImmediatelyRef = useRef(saveImmediately);
+  saveImmediatelyRef.current = saveImmediately;
 
   // Flush any pending save immediately (saves to the note currently loaded in editor)
   const flushPendingSave = useCallback(async () => {
@@ -911,14 +1047,18 @@ export function Editor({
       clearTimeout(saveTimeoutRef.current);
       saveTimeoutRef.current = null;
     }
-
-    // Use loadedNoteIdRef (the note in the editor) not currentNoteIdRef (which may have changed)
-    if (needsSaveRef.current && editorRef.current && loadedNoteIdRef.current) {
-      needsSaveRef.current = false;
-      const markdown = getMarkdown(editorRef.current);
-      await saveImmediately(loadedNoteIdRef.current, markdown);
+    if (sourceTimeoutRef.current) {
+      clearTimeout(sourceTimeoutRef.current);
+      sourceTimeoutRef.current = null;
     }
-  }, [saveImmediately, getMarkdown]);
+
+    // Use loadedNoteIdRef (the note in the editor) not currentNoteIdRef
+    // (which may already point at the next selected note).
+    if (documentSessionRef.current?.isDirty && loadedNoteIdRef.current) {
+      needsSaveRef.current = false;
+      await saveImmediately(loadedNoteIdRef.current, "autosave");
+    }
+  }, [saveImmediately]);
 
   // Schedule a debounced save (markdown computed only when timer fires)
   const scheduleSave = useCallback(() => {
@@ -937,14 +1077,36 @@ export function Editor({
         return;
       }
 
-      // Compute markdown only now, when we actually save
       if (editorRef.current) {
         needsSaveRef.current = false;
-        const markdown = getMarkdown(editorRef.current);
-        await saveImmediately(savingNoteId, markdown);
+        await saveImmediately(savingNoteId, "autosave");
       }
     }, 500);
-  }, [saveImmediately, getMarkdown, currentNote?.id]);
+  }, [saveImmediately, currentNote?.id]);
+
+  useEffect(() => {
+    const handleExplicitSave = (event: KeyboardEvent) => {
+      if (
+        !(event.metaKey || event.ctrlKey) ||
+        event.shiftKey ||
+        event.altKey ||
+        event.key.toLowerCase() !== "s"
+      ) {
+        return;
+      }
+      event.preventDefault();
+      if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+      if (sourceTimeoutRef.current) clearTimeout(sourceTimeoutRef.current);
+      saveTimeoutRef.current = null;
+      sourceTimeoutRef.current = null;
+      const noteId = loadedNoteIdRef.current;
+      if (noteId) void saveImmediately(noteId, "explicit");
+    };
+
+    window.addEventListener("keydown", handleExplicitSave, true);
+    return () =>
+      window.removeEventListener("keydown", handleExplicitSave, true);
+  }, [saveImmediately]);
 
   const closeBlockMathPopup = useCallback(() => {
     if (blockMathPopupRef.current) {
@@ -1210,32 +1372,96 @@ export function Editor({
     });
   }, [closeBlockMathPopup, handleEditBlockMath]);
 
+  const insertClipboardPayload = useCallback(
+    async (payload: ClipboardPayload, exact = false) => {
+      const currentEditor = editorRef.current;
+      if (!currentEditor) return;
+
+      const adapter: ClipboardInsertionAdapter = {
+        insertHtml: (html) => {
+          const parsed = parseClipboardHtmlPreservingContent(
+            currentEditor.schema,
+            html,
+            document,
+          );
+          return currentEditor
+            .chain()
+            .focus()
+            .insertContent(parsed.content ?? [])
+            .run();
+        },
+        insertMarkdown: (markdown) => {
+          const manager = currentEditor.storage.markdown?.manager;
+          if (!manager) return false;
+          const parsed = parseMarkdownPreservingContent(manager, markdown);
+          return currentEditor
+            .chain()
+            .focus()
+            .insertContent(parsed.content ?? [])
+            .run();
+        },
+        insertText: (text) => {
+          if (!text) return;
+          currentEditor
+            .chain()
+            .focus()
+            .insertContent(literalTextContent(text))
+            .run();
+        },
+      };
+
+      await performClipboardPaste(payload, adapter, {
+        exact,
+        document,
+        onFallback: (reason) => {
+          toast.warning(
+            `Rich paste was inserted as complete plain text: ${reason}`,
+          );
+        },
+      });
+    },
+    [],
+  );
+
   const editor = useEditor({
     textDirection,
     extensions: [
-      StarterKit.configure({
-        heading: false,
-        codeBlock: false,
-      }),
-      CollapsibleHeadings.configure({
-        levels: [1, 2, 3, 4, 5, 6],
-      }),
-      CodeBlockLowlight.extend({
-        addNodeView() {
-          return ReactNodeViewRenderer(CodeBlockView);
-        },
-      }).configure({
-        lowlight,
-        defaultLanguage: null,
+      ...createMarkdownSchemaExtensions({
+        codeBlock: CodeBlockLowlight.extend({
+          addNodeView() {
+            return ReactNodeViewRenderer(CodeBlockView);
+          },
+        }).configure({
+          lowlight,
+          defaultLanguage: null,
+        }),
+        link: Link.configure({
+          openOnClick: false,
+          HTMLAttributes: {
+            class: "underline cursor-pointer",
+          },
+        }),
+        table: TableKit.configure({
+          table: {
+            resizable: false,
+            HTMLAttributes: {
+              class: "not-prose",
+            },
+          },
+        }),
+        blockMath: ScratchBlockMath.configure({
+          katexOptions: {
+            throwOnError: false,
+            displayMode: true,
+            macros: katexMacros,
+          },
+          onClick: (_node, pos) => {
+            handleEditBlockMath(pos);
+          },
+        }),
       }),
       Placeholder.configure({
         placeholder: "Start writing...",
-      }),
-      Link.configure({
-        openOnClick: false,
-        HTMLAttributes: {
-          class: "underline cursor-pointer",
-        },
       }),
       // Convert markdown link syntax [text](url) into real links when typed
       Extension.create({
@@ -1260,47 +1486,13 @@ export function Editor({
           ];
         },
       }),
-      Image.configure({
-        inline: false,
-        allowBase64: false,
-      }),
-      TaskList,
-      TaskItem.configure({
-        nested: true,
-      }),
-      Highlight.configure({
-        multicolor: true,
-      }),
-      TextStyle,
-      Color,
-      TableKit.configure({
-        table: {
-          resizable: false,
-          HTMLAttributes: {
-            class: "not-prose",
-          },
-        },
-      }),
-      Frontmatter,
       Markdown.configure({}),
       SearchHighlight.configure({
         matches: [],
         currentIndex: 0,
       }),
       SlashCommand,
-      Wikilink,
       WikilinkSuggestion,
-      FootnoteReference,
-      ScratchBlockMath.configure({
-        katexOptions: {
-          throwOnError: false,
-          displayMode: true,
-          macros: katexMacros,
-        },
-        onClick: (_node, pos) => {
-          handleEditBlockMath(pos);
-        },
-      }),
     ],
     editorProps: {
       attributes: {
@@ -1357,7 +1549,7 @@ export function Editor({
 
         // Check for images first
         const items = Array.from(clipboardData.items);
-        const imageItem = items.find((item) => item.type.startsWith("image/"));
+        const imageItem = findClipboardImageItem(items);
 
         if (imageItem) {
           const blob = imageItem.getAsFile();
@@ -1401,46 +1593,28 @@ export function Editor({
           }
         }
 
-        // Handle markdown text paste
-        const text = clipboardData.getData("text/plain");
-        if (!text) return false;
+        const payload: ClipboardPayload = {
+          markdown: clipboardData.getData("text/markdown"),
+          html: clipboardData.getData("text/html"),
+          text: clipboardData.getData("text/plain"),
+        };
+        if (!payload.markdown && !payload.html && !payload.text) return false;
 
-        const pastedText = prepareMarkdownPaste(text);
-
-        // Check if text looks like markdown (has common markdown patterns)
-        const markdownPatterns =
-          /^#{1,6}\s|^\s*[-*+]\s|^\s*\d+\.\s|^\s*>\s|```|^\s*\[.*\]\(.*\)|^\s*!\[|\*\*.*\*\*|__.*__|~~.*~~|^\s*[-*_]{3,}\s*$|^\|.+\||\$\$[\s\S]+?\$\$/m;
-        if (!markdownPatterns.test(pastedText)) {
-          // Not markdown, let TipTap handle it normally
-          return false;
-        }
-
-        // Parse markdown and insert using editor ref
-        const currentEditor = editorRef.current;
-        if (!currentEditor) return false;
-
-        const manager = currentEditor.storage.markdown?.manager;
-        if (manager && typeof manager.parse === "function") {
-          try {
-            const parsed = manager.parse(pastedText);
-            if (parsed) {
-              currentEditor.commands.insertContent(parsed);
-              return true;
-            }
-          } catch {
-            // Fall back to default paste behavior
-          }
-        }
-
-        return false;
+        void insertClipboardPayload(payload);
+        return true;
       },
     },
     onCreate: ({ editor: editorInstance }) => {
       editorRef.current = editorInstance;
     },
-    onUpdate: () => {
+    onUpdate: ({ editor: updatedEditor }) => {
       if (isLoadingRef.current) return;
-      scheduleSave();
+      const markdown = getMarkdown(updatedEditor);
+      const recorded =
+        documentSessionRef.current?.recordVisualEdit(markdown) ?? false;
+      if (recorded) {
+        scheduleSave();
+      }
     },
     onSelectionUpdate: () => {
       // Trigger re-render to update toolbar active states without flushSync in lifecycle
@@ -1668,16 +1842,16 @@ export function Editor({
         loadedModifiedRef.current = currentNote.modified;
         lastSaveRef.current = null;
         // If user typed during the rename, flush with the now-correct ID
-        if (needsSaveRef.current) {
-          flushPendingSave();
+        if (documentSessionRef.current?.isDirty) {
+          void flushPendingSave();
         }
         return;
       }
     }
 
     // Flush any pending save before switching to a different note
-    if (!isSameNote && needsSaveRef.current) {
-      flushPendingSave();
+    if (!isSameNote && documentSessionRef.current?.isDirty) {
+      void flushPendingSave();
     }
     // Reset source mode when genuinely switching notes (renames return early above)
     if (!isSameNote) {
@@ -1695,23 +1869,48 @@ export function Editor({
         // Manual reload - update the editor content
         lastReloadVersionRef.current = reloadVersion;
         loadedModifiedRef.current = currentNote.modified;
+        documentSessionRef.current?.hydrate(currentNote.snapshot);
+        documentSessionRef.current?.setPreserveSourceFormatting(
+          preserveSourceFormatting,
+        );
+        setSourceContent(toSourceEditorText(currentNote.content));
+        if (preserveSourceFormatting) {
+          documentSessionRef.current?.setMode("source");
+          setSourceMode(true);
+        }
         isLoadingRef.current = true;
         const manager = editor.storage.markdown?.manager;
         if (manager) {
           try {
-            const parsed = manager.parse(currentNote.content);
-            editor.commands.setContent(parsed);
-          } catch {
-            editor.commands.setContent(currentNote.content);
+            const parsed = parseMarkdownPreservingContent(
+              manager,
+              currentNote.content,
+            );
+            documentSessionRef.current?.runProgrammatic(() => {
+              editor.commands.setContent(parsed);
+            });
+          } catch (error) {
+            setSourceMode(true);
+            toast.error(
+              `Visual conversion was blocked to protect the source: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
           }
-        } else {
-          editor.commands.setContent(currentNote.content);
         }
         isLoadingRef.current = false;
         return;
       }
       // Just a save - update refs but don't reload content
       loadedModifiedRef.current = currentNote.modified;
+      const session = documentSessionRef.current;
+      if (
+        session &&
+        session.currentSnapshot.hash !== currentNote.snapshot.hash
+      ) {
+        session.rebaseSnapshot(currentNote.snapshot);
+        setIsUnsaved(session.isDirty);
+      }
       return;
     }
 
@@ -1721,6 +1920,15 @@ export function Editor({
 
     loadedNoteIdRef.current = loadingNoteId;
     loadedModifiedRef.current = currentNote.modified;
+    documentSessionRef.current = new DocumentSession(currentNote.snapshot);
+    documentSessionRef.current.setPreserveSourceFormatting(
+      preserveSourceFormatting,
+    );
+    setSourceContent(toSourceEditorText(currentNote.content));
+    if (preserveSourceFormatting) {
+      documentSessionRef.current.setMode("source");
+      setSourceMode(true);
+    }
 
     isLoadingRef.current = true;
 
@@ -1731,14 +1939,21 @@ export function Editor({
     const manager = editor.storage.markdown?.manager;
     if (manager) {
       try {
-        const parsed = manager.parse(currentNote.content);
-        editor.commands.setContent(parsed);
-      } catch {
-        // Fallback to plain text if parsing fails
-        editor.commands.setContent(currentNote.content);
+        const parsed = parseMarkdownPreservingContent(
+          manager,
+          currentNote.content,
+        );
+        documentSessionRef.current.runProgrammatic(() => {
+          editor.commands.setContent(parsed);
+        });
+      } catch (error) {
+        setSourceMode(true);
+        toast.error(
+          `Visual conversion was blocked to protect the source: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
       }
-    } else {
-      editor.commands.setContent(currentNote.content);
     }
 
     // Scroll to top after content is set (must be after setContent to work reliably)
@@ -1782,6 +1997,7 @@ export function Editor({
     flushPendingSave,
     reloadVersion,
     consumePendingNewNote,
+    preserveSourceFormatting,
   ]);
 
   // Scroll to top on mount (e.g., when returning from settings)
@@ -1795,15 +2011,15 @@ export function Editor({
       if (saveTimeoutRef.current) {
         clearTimeout(saveTimeoutRef.current);
       }
-      // Flush any pending save before unmounting
-      if (needsSaveRef.current && editorRef.current) {
+      if (sourceTimeoutRef.current) {
+        clearTimeout(sourceTimeoutRef.current);
+      }
+      if (documentSessionRef.current?.isDirty && loadedNoteIdRef.current) {
         needsSaveRef.current = false;
-        const manager = editorRef.current.storage.markdown?.manager;
-        const markdown = manager
-          ? manager.serialize(editorRef.current.getJSON())
-          : editorRef.current.getText();
-        // Fire and forget - save will complete in background
-        saveNote(markdown);
+        void saveImmediatelyRef.current(
+          loadedNoteIdRef.current,
+          "autosave",
+        );
       }
       if (linkPopupRef.current) {
         linkPopupRef.current.destroy();
@@ -1942,29 +2158,48 @@ export function Editor({
     });
   }, [editor, closeBlockMathPopup]);
 
-  // Auto-save in source mode with debounce
+  const scheduleSourceSave = useCallback(() => {
+    setIsUnsaved(true);
+    if (sourceTimeoutRef.current) {
+      clearTimeout(sourceTimeoutRef.current);
+    }
+    const savingNoteId = currentNote?.id;
+    if (!savingNoteId) return;
+    sourceTimeoutRef.current = window.setTimeout(async () => {
+      if (currentNoteIdRef.current !== savingNoteId) return;
+      await saveImmediately(savingNoteId, "autosave");
+    }, 300);
+  }, [currentNote, saveImmediately]);
+
+  // Textareas expose logical LF line endings. The session maps each user edit
+  // back onto the lossless source snapshot so untouched CRLF/CR bytes survive.
   const handleSourceChange = useCallback(
     (value: string) => {
       setSourceContent(value);
-      if (sourceTimeoutRef.current) {
-        clearTimeout(sourceTimeoutRef.current);
-      }
-      sourceTimeoutRef.current = window.setTimeout(async () => {
-        if (currentNote) {
-          setIsSaving(true);
-          try {
-            lastSaveRef.current = { noteId: currentNote.id, content: value };
-            await saveNote(value, currentNote.id);
-          } catch (error) {
-            console.error("Failed to save note:", error);
-            toast.error("Failed to save note");
-          } finally {
-            setIsSaving(false);
-          }
-        }
-      }, 300);
+      if (!documentSessionRef.current?.recordSourceEditorEdit(value)) return;
+      scheduleSourceSave();
     },
-    [currentNote, saveNote],
+    [scheduleSourceSave],
+  );
+
+  const insertExactSourceText = useCallback(
+    (textarea: HTMLTextAreaElement, delivered: string) => {
+      const session = documentSessionRef.current;
+      if (!session) return false;
+      const insertion = session.insertExactSourceText(
+        textarea.selectionStart,
+        textarea.selectionEnd,
+        delivered,
+      );
+      setSourceContent(insertion.editorContent);
+      if (insertion.changed) scheduleSourceSave();
+      requestAnimationFrame(() => {
+        textarea.focus();
+        textarea.setSelectionRange(insertion.cursor, insertion.cursor);
+      });
+      return insertion.changed;
+    },
+    [scheduleSourceSave],
   );
 
   // Automatic list continuation and indentation support for source mode editor
@@ -2280,7 +2515,7 @@ export function Editor({
         const insertText = `[^${nextLabel}]`;
         const newContent = before + insertText + after;
 
-        setSourceContent(newContent);
+        handleSourceChange(newContent);
 
         setTimeout(() => {
           textarea.focus();
@@ -2299,7 +2534,14 @@ export function Editor({
           .run();
       }
     }
-  }, [currentNote, footnotesMap, addFootnote, sourceMode, editor]);
+  }, [
+    currentNote,
+    footnotesMap,
+    addFootnote,
+    sourceMode,
+    editor,
+    handleSourceChange,
+  ]);
 
   // Insert current date handler
   const handleInsertCurrentDate = useCallback(() => {
@@ -2626,7 +2868,12 @@ export function Editor({
 
     if (!sourceMode) {
       // === Entering source mode (TipTap → textarea) ===
-      const md = getMarkdown(editor);
+      const session = documentSessionRef.current;
+      const rawMarkdown =
+        session && !session.isDirty
+          ? session.currentSourceContent
+          : getMarkdown(editor);
+      const md = toSourceEditorText(rawMarkdown);
 
       // Find which top-level block is at the viewport top
       let topBlockIndex = 0;
@@ -2662,8 +2909,18 @@ export function Editor({
 
       sourceModeTransitionRef.current = { topBlockIndex, cursorBlockIndex, md };
       setSourceContent(md);
+      if (session?.isDirty) {
+        session.runProgrammatic(() => session.recordSourceEditorEdit(md));
+      }
+      session?.setMode("source");
       setSourceMode(true);
     } else {
+      if (preserveSourceFormatting) {
+        toast.info(
+          "Source formatting is protected. Disable preservation to use the visual editor.",
+        );
+        return;
+      }
       // === Exiting source mode (textarea → TipTap) ===
       const textarea = container?.querySelector(
         "textarea",
@@ -2694,17 +2951,29 @@ export function Editor({
       const manager = editor.storage.markdown?.manager;
       if (manager) {
         try {
-          const parsed = manager.parse(sourceContent);
-          editor.commands.setContent(parsed);
-        } catch {
-          editor.commands.setContent(sourceContent);
+          const parsed = parseMarkdownPreservingContent(manager, sourceContent);
+          documentSessionRef.current?.runProgrammatic(() => {
+            editor.commands.setContent(parsed);
+          });
+        } catch (error) {
+          toast.error(
+            `Visual conversion was blocked to protect the source: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          return;
         }
-      } else {
-        editor.commands.setContent(sourceContent);
       }
+      documentSessionRef.current?.setMode("visual");
       setSourceMode(false);
     }
-  }, [editor, sourceMode, sourceContent, getMarkdown]);
+  }, [
+    editor,
+    sourceMode,
+    sourceContent,
+    getMarkdown,
+    preserveSourceFormatting,
+  ]);
 
   // Restore focus and scroll position after source mode transitions.
   // useLayoutEffect runs synchronously after React commits DOM changes,
@@ -2973,34 +3242,122 @@ export function Editor({
     }
   }, [editorContextMenu, editor, sourceMode, handleSourceChange]);
 
-  const handleContextPaste = useCallback(async () => {
-    try {
-      const pastedText = await navigator.clipboard.readText();
-      if (!pastedText) {
-        toast.info("Clipboard is empty");
-        return;
-      }
-
-      const preparedPastedText = prepareMarkdownPaste(pastedText);
-
-      if (sourceMode) {
-        const textarea = document.querySelector("textarea") as HTMLTextAreaElement | null;
-        if (textarea) {
-          const start = textarea.selectionStart;
-          const end = textarea.selectionEnd;
-          const val = textarea.value;
-          const newVal = val.substring(0, start) + preparedPastedText + val.substring(end);
-          handleSourceChange(newVal);
+  const handleContextPaste = useCallback(
+    async (exact = false) => {
+      try {
+        const payload = await readClipboardPayload(navigator.clipboard);
+        if (!payload.markdown && !payload.html && !payload.text) {
+          toast.info("Clipboard is empty");
+          return;
         }
-      } else if (editor) {
-        editor.chain().focus().insertContent(preparedPastedText).run();
+
+        if (!sourceMode) {
+          await insertClipboardPayload(payload, exact);
+        } else {
+          const textarea = scrollContainerRef.current?.querySelector(
+            "textarea",
+          ) as HTMLTextAreaElement | null;
+          const manager = editor?.storage.markdown?.manager;
+          if (!textarea || !editor || !manager) return;
+
+          const insertSourceText = (text: string) => {
+            if (exact) {
+              insertExactSourceText(textarea, text);
+              return;
+            }
+            const start = textarea.selectionStart;
+            const end = textarea.selectionEnd;
+            const value = textarea.value;
+            const next = value.slice(0, start) + text + value.slice(end);
+            handleSourceChange(next);
+            requestAnimationFrame(() => {
+              const position = start + text.length;
+              textarea.focus();
+              textarea.setSelectionRange(position, position);
+            });
+          };
+          const adapter: ClipboardInsertionAdapter = {
+            insertHtml: (html) => {
+              const parsed = parseClipboardHtmlPreservingContent(
+                editor.schema,
+                html,
+                document,
+              );
+              insertSourceText(manager.serialize(parsed));
+              return true;
+            },
+            insertMarkdown: (markdown) => {
+              parseMarkdownPreservingContent(manager, markdown);
+              insertSourceText(markdown);
+              return true;
+            },
+            insertText: insertSourceText,
+          };
+          await performClipboardPaste(payload, adapter, {
+            exact,
+            document,
+            onFallback: (reason) =>
+              toast.warning(
+                `Rich paste was inserted as complete plain text: ${reason}`,
+              ),
+          });
+        }
+        toast.success(exact ? "Pasted exactly" : "Pasted");
+      } catch (error) {
+        console.error("Failed to paste:", error);
+        toast.error("Unable to access clipboard. Use shortcut Ctrl+V / Cmd+V");
       }
-      toast.success("Pasted");
-    } catch (err) {
-      console.error("Failed to paste:", err);
-      toast.error("Unable to access clipboard. Use shortcut Ctrl+V / Cmd+V");
+    },
+    [
+      editor,
+      sourceMode,
+      handleSourceChange,
+      insertExactSourceText,
+      insertClipboardPayload,
+    ],
+  );
+
+  const handleToggleSourcePreservation = useCallback(async () => {
+    if (!currentNote || previewMode) return;
+    const enabling = !preserveSourceFormatting;
+
+    if (enabling && documentSessionRef.current?.isDirty) {
+      await saveImmediately(currentNote.id, "explicit");
+      if (documentSessionRef.current?.isDirty) return;
     }
-  }, [editor, sourceMode, handleSourceChange]);
+
+    const currentSettings = settings ?? (await notesService.getSettings());
+    const protectedIds = new Set(
+      currentSettings.preserveSourceFormattingNoteIds ?? [],
+    );
+    if (enabling) protectedIds.add(currentNote.id);
+    else protectedIds.delete(currentNote.id);
+    const updatedSettings = {
+      ...currentSettings,
+      preserveSourceFormattingNoteIds: [...protectedIds],
+    };
+    await notesService.updateSettings(updatedSettings);
+    setSettings(updatedSettings);
+    documentSessionRef.current?.setPreserveSourceFormatting(enabling);
+
+    if (enabling) {
+      const source =
+        documentSessionRef.current?.currentSourceContent ??
+        currentNote.content;
+      setSourceContent(toSourceEditorText(source));
+      documentSessionRef.current?.setMode("source");
+      setSourceMode(true);
+      toast.success("Source formatting protection enabled");
+    } else {
+      toast.success("Source formatting protection disabled");
+    }
+  }, [
+    currentNote,
+    previewMode,
+    preserveSourceFormatting,
+    saveImmediately,
+    settings,
+  ]);
 
   const handleContextFormatTable = useCallback(() => {
     try {
@@ -3175,21 +3532,10 @@ export function Editor({
         )}
         <div className="flex-1 flex items-center justify-center pb-8">
           <div className="text-center text-text-muted select-none">
-            <div
-              role="img"
-              aria-label="Note"
-              className="w-42 aspect-square mx-auto mb-1"
-              style={{
-                backgroundColor: "var(--color-text)",
-                WebkitMaskImage: "url(/note-dark.png)",
-                WebkitMaskSize: "contain",
-                WebkitMaskRepeat: "no-repeat",
-                WebkitMaskPosition: "center",
-                maskImage: "url(/note-dark.png)",
-                maskSize: "contain",
-                maskRepeat: "no-repeat",
-                maskPosition: "center",
-              }}
+            <img
+              src="/markdown-editor-logo.png"
+              alt="Markdown Editor"
+              className="w-42 aspect-square object-contain mx-auto mb-1"
             />
             <h1 className="text-2xl text-text font-serif mb-1 tracking-[-0.01em] ">
               What's on your mind?
@@ -3250,7 +3596,22 @@ export function Editor({
         <div
           className={`titlebar-no-drag flex items-center gap-px shrink-0 transition-opacity duration-400 ${needsSidebarDelay ? "delay-200" : ""} ${focusMode ? "opacity-0 pointer-events-none" : "opacity-100"}`}
         >
-          {hasExternalChanges ? (
+          {saveConflict ? (
+            <Tooltip
+              content={`${saveConflict.message}. Your recovery draft is retained; reload the disk version when ready.`}
+            >
+              <button
+                onClick={async () => {
+                  await reloadCurrentNote();
+                  setSaveConflict(null);
+                }}
+                className="h-7 px-2 flex items-center gap-1 text-xs text-amber-700 dark:text-amber-300 hover:bg-bg-emphasis rounded transition-colors font-medium"
+              >
+                <RefreshCwIcon className="w-4 h-4 stroke-[1.6]" />
+                <span>Conflict — reload</span>
+              </button>
+            </Tooltip>
+          ) : hasExternalChanges ? (
             <Tooltip
               content={`External changes detected (${mod}${isMac ? "" : "+"}R to refresh)`}
             >
@@ -3281,6 +3642,13 @@ export function Editor({
               <div className="h-6.5 px-2 flex items-center gap-1.5 text-[11px] text-text-muted/70 bg-bg-muted/30 rounded-md border border-border/30 select-none">
                 <CircleCheckIcon className="w-3.5 h-3.5 text-emerald-500/80 stroke-[2]" />
                 <span className="font-medium">Saved</span>
+              </div>
+            </Tooltip>
+          )}
+          {preserveSourceFormatting && (
+            <Tooltip content="Exact source formatting is protected">
+              <div className="h-6.5 px-2 flex items-center text-[11px] text-text-muted bg-bg-muted/30 rounded-md border border-border/30 select-none">
+                Source protected
               </div>
             </Tooltip>
           )}
@@ -3459,6 +3827,14 @@ export function Editor({
                 value={sourceContent}
                 onChange={(e) => handleSourceChange(e.target.value)}
                 onKeyDown={handleSourceKeyDown}
+                onPaste={(event) => {
+                  const delivered =
+                    event.clipboardData.getData("text/markdown") ||
+                    event.clipboardData.getData("text/plain");
+                  if (!delivered) return;
+                  event.preventDefault();
+                  insertExactSourceText(event.currentTarget, delivered);
+                }}
                 wrap="off"
                 dir={textDirection}
                 className="w-full h-full bg-transparent text-text focus:outline-none resize-none px-6 pt-8 pb-24 mx-auto block"
@@ -3895,6 +4271,23 @@ export function Editor({
 
             {/* Format Tools Section */}
             <div className="py-1 border-b border-border/50">
+              {!previewMode && (
+                <button
+                  onClick={() => {
+                    void handleToggleSourcePreservation();
+                    setEditorContextMenu(null);
+                  }}
+                  className="w-full text-left px-3 py-1.5 hover:bg-bg-muted focus:bg-bg-muted flex items-center justify-between cursor-pointer transition-colors font-medium text-text"
+                >
+                  <div className="flex items-center gap-2">
+                    <CircleCheckIcon className="w-4 h-4 text-emerald-500" />
+                    <span>Preserve source formatting</span>
+                  </div>
+                  <span className="text-[10px] text-text-muted">
+                    {preserveSourceFormatting ? "On" : "Off"}
+                  </span>
+                </button>
+              )}
               <button
                 onClick={() => {
                   handleToggleCase();
@@ -4031,6 +4424,21 @@ export function Editor({
                 </div>
                 <span className="text-[10px] text-text-muted font-mono">
                   {mod}+V
+                </span>
+              </button>
+              <button
+                onClick={() => {
+                  handleContextPaste(true);
+                  setEditorContextMenu(null);
+                }}
+                className="w-full text-left px-3 py-1.5 hover:bg-bg-muted focus:bg-bg-muted flex items-center justify-between cursor-pointer transition-colors font-medium text-text"
+              >
+                <div className="flex items-center gap-2">
+                  <PasteIcon className="w-4 h-4 text-text-muted" />
+                  <span>Paste exactly</span>
+                </div>
+                <span className="text-[10px] text-text-muted">
+                  No conversion
                 </span>
               </button>
             </div>

@@ -1,10 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
+import type {
+  DocumentSaveRequest,
+  DocumentSnapshot,
+} from "../lib/documentLifecycle";
 
 export interface FileContent {
   path: string;
   content: string;
   title: string;
   modified: number;
+  snapshot: DocumentSnapshot;
 }
 
 export async function readFileDirect(path: string): Promise<FileContent> {
@@ -13,9 +18,16 @@ export async function readFileDirect(path: string): Promise<FileContent> {
 
 export async function saveFileDirect(
   path: string,
-  content: string,
+  request: DocumentSaveRequest,
 ): Promise<FileContent> {
-  return invoke("save_file_direct", { path, content });
+  return invoke("save_file_direct", { path, request });
+}
+
+export async function retainFileRecoveryDraft(
+  path: string,
+  request: DocumentSaveRequest,
+): Promise<string> {
+  return invoke("retain_file_recovery_draft", { path, request });
 }
 
 export async function openFilePreview(path: string): Promise<void> {

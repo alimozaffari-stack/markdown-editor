@@ -1,3 +1,5 @@
+import type { DocumentSnapshot } from "../lib/documentLifecycle";
+
 export interface NoteMetadata {
   id: string;
   title: string;
@@ -25,6 +27,7 @@ export interface Note {
   content: string;
   path: string;
   modified: number;
+  snapshot: DocumentSnapshot;
 }
 
 export interface ThemeSettings {
@@ -74,6 +77,7 @@ export interface Settings {
   ignoredPatterns?: string[];
   customColorsLight?: CustomColors;
   customColorsDark?: CustomColors;
+  preserveSourceFormattingNoteIds?: string[];
 }
 
 export interface FolderNode {
