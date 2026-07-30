@@ -561,9 +561,7 @@ fn replace_recovery_copy(temporary: &Path, target: &Path) -> io::Result<()> {
                 if let Err(restore_error) = fs::set_permissions(target, permissions) {
                     return Err(io::Error::new(
                         error.kind(),
-                        format!(
-                            "{error}; failed to restore recovery permissions: {restore_error}"
-                        ),
+                        format!("{error}; failed to restore recovery permissions: {restore_error}"),
                     ));
                 }
             }
@@ -1157,11 +1155,7 @@ mod tests {
         let first = retain_recovery_draft(
             &target,
             &recovery,
-            &save_request(
-                &baseline,
-                "# First candidate\n",
-                DocumentAuthority::Source,
-            ),
+            &save_request(&baseline, "# First candidate\n", DocumentAuthority::Source),
         )
         .expect("first recovery draft");
         let second = retain_recovery_draft(
