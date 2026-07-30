@@ -312,7 +312,7 @@ impl SearchIndex {
                     continue;
                 }
                 if let Some(id) = id_from_abs_path(notes_folder, file_path, ignored_dirs) {
-                    if let Ok(content) = std::fs::read_to_string(file_path) {
+                    if let Ok(content) = document::load_document_content(file_path) {
                         let modified = entry
                             .metadata()
                             .ok()
@@ -1012,7 +1012,7 @@ async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMetadata>, Str
                 continue;
             }
             if let Some(id) = id_from_abs_path(&path_clone, file_path, &ignored_dirs) {
-                if let Ok(content) = std::fs::read_to_string(file_path) {
+                if let Ok(content) = document::load_document_content(file_path) {
                     let modified = entry
                         .metadata()
                         .ok()
@@ -2220,7 +2220,7 @@ async fn fallback_search(
             Ok(p) => p,
             Err(_) => continue,
         };
-        if let Ok(content) = tokio::fs::read_to_string(&file_path).await {
+        if let Ok(content) = document::load_document_content(&file_path) {
             let content_lower = content.to_lowercase();
             if content_lower.contains(&query_lower) {
                 // Higher score if in title, lower if only in content
@@ -2321,7 +2321,7 @@ fn setup_file_watcher(
                         if let Some(ref search_index) = *index {
                             match kind {
                                 "created" | "modified" => {
-                                    match std::fs::read_to_string(path) {
+                                    match document::load_document_content(path) {
                                         Ok(content) => {
                                             let title = extract_title(&content);
                                             let modified = std::fs::metadata(path)

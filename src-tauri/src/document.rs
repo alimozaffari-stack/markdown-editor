@@ -264,6 +264,10 @@ pub fn load_document(path: &Path) -> Result<DocumentSnapshot, SaveFailure> {
     read_document_with_bytes(path).map(|(snapshot, _)| snapshot)
 }
 
+pub fn load_document_content(path: &Path) -> Result<String, SaveFailure> {
+    load_document(path).map(|snapshot| snapshot.content)
+}
+
 fn encode_document(
     content: &str,
     encoding: DocumentEncoding,
@@ -861,6 +865,21 @@ mod tests {
             (utf16be.content.as_str(), utf16be.encoding, utf16be.bom),
             ("BE ✓\n", DocumentEncoding::Utf16be, DocumentBom::Utf16be)
         );
+    }
+
+    #[test]
+    fn discovery_content_loads_bom_marked_utf16() {
+        let directory = tempdir().expect("temporary directory");
+        let target = directory.path().join("managed.md");
+        fs::write(
+            &target,
+            utf16_bytes("# Managed UTF-16\n\nVisible preview\n", true),
+        )
+        .expect("UTF-16 fixture");
+
+        let content = load_document_content(&target).expect("discovery content");
+
+        assert_eq!(content, "# Managed UTF-16\n\nVisible preview\n");
     }
 
     #[test]

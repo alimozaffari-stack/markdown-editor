@@ -19,6 +19,16 @@ import {
   mergeEditedContentIntoSource,
   parseNoteAnnotations,
 } from "../lib/noteAnnotations";
+import { createRebasedSaveQueue } from "../lib/rebasedSaveQueue";
+
+interface AnnotationState {
+  footnotes: Footnote[];
+  comments: Comment[];
+}
+
+interface SaveNoteOptions {
+  preserveOptimisticAnnotations?: boolean;
+}
 
 export function extractComments(content: string): { cleanContent: string; comments: Comment[] } {
   const match = content.match(
@@ -253,6 +263,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   footnotesMapRef.current = footnotesMap;
   const currentNoteRef = useRef(currentNote);
   currentNoteRef.current = currentNote;
+  const annotationSaveQueueRef = useRef(
+    createRebasedSaveQueue<string, AnnotationState, Note>(),
+  );
   // Monotonic counter to ignore stale async note selection responses.
   const selectRequestIdRef = useRef(0);
   // Monotonic counter to ignore stale async search responses
@@ -310,6 +323,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         ...prev,
         [id]: prepared.comments,
       }));
+      annotationSaveQueueRef.current.setBase(id, prepared.note);
       setCurrentNote(prepared.note);
     } catch (err) {
       if (requestId !== selectRequestIdRef.current) return;
@@ -330,6 +344,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         ...prev,
         [selectedNoteIdRef.current!]: prepared.comments,
       }));
+      annotationSaveQueueRef.current.setBase(
+        selectedNoteIdRef.current,
+        prepared.note,
+      );
       setCurrentNote(prepared.note);
       setHasExternalChanges(false);
       setReloadVersion((v) => v + 1);
@@ -378,7 +396,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const saveNote = useCallback(
-    async (request: DocumentSaveRequest, noteId?: string) => {
+    async (
+      request: DocumentSaveRequest,
+      noteId?: string,
+      options?: SaveNoteOptions,
+    ) => {
       // Use provided noteId (for flush saves) or fall back to currentNote.id
       const savingNoteId = noteId || currentNote?.id;
       if (!savingNoteId) return null;
@@ -399,6 +421,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         );
         const prepared = prepareNoteForEditing(updated);
         updatedId = updated.id;
+        if (updated.id !== savingNoteId) {
+          annotationSaveQueueRef.current.clearBase(savingNoteId);
+        }
+        annotationSaveQueueRef.current.setBase(updated.id, prepared.note);
 
         // If the note was renamed (ID changed), also mark the new ID
         if (updated.id !== savingNoteId) {
@@ -417,16 +443,22 @@ export function NotesProvider({ children }: { children: ReactNode }) {
             await notesService.updateSettings(updatedSettings);
           }
         }
-        setCommentsMap((prev) => {
-          const next = { ...prev, [updated.id]: prepared.comments };
-          if (updated.id !== savingNoteId) delete next[savingNoteId];
-          return next;
-        });
-        setFootnotesMap((prev) => {
-          const next = { ...prev, [updated.id]: prepared.footnotes };
-          if (updated.id !== savingNoteId) delete next[savingNoteId];
-          return next;
-        });
+        if (!options?.preserveOptimisticAnnotations) {
+          commentsMapRef.current = {
+            ...commentsMapRef.current,
+            [updated.id]: prepared.comments,
+          };
+          footnotesMapRef.current = {
+            ...footnotesMapRef.current,
+            [updated.id]: prepared.footnotes,
+          };
+          if (updated.id !== savingNoteId) {
+            delete commentsMapRef.current[savingNoteId];
+            delete footnotesMapRef.current[savingNoteId];
+          }
+          setCommentsMap(commentsMapRef.current);
+          setFootnotesMap(footnotesMapRef.current);
+        }
 
         // Clear external changes flag - if it was set by our own save, we want to ignore it
         setHasExternalChanges(false);
@@ -587,24 +619,38 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       footnotes: Footnote[],
       comments: Comment[],
     ) => {
-      const loaded =
-        currentNoteRef.current?.id === noteId
-          ? currentNoteRef.current
-          : prepareNoteForEditing(await notesService.readNote(noteId)).note;
-      if (!loaded) return;
-      const storageContent = appendComments(
-        appendFootnotes(loaded.content, footnotes),
-        comments,
-      );
-      await saveNote(
-        {
-          ...notesService.createSaveRequest(
-            loaded.snapshot,
-            storageContent,
-          ),
-          contentIsStorageSource: true,
-        },
+      await annotationSaveQueueRef.current.enqueue(
         noteId,
+        { footnotes, comments },
+        {
+          load: async (queuedNoteId) =>
+            currentNoteRef.current?.id === queuedNoteId
+              ? currentNoteRef.current
+              : prepareNoteForEditing(
+                  await notesService.readNote(queuedNoteId),
+                ).note,
+          save: async (queuedNoteId, annotations, loaded) => {
+            const storageContent = appendComments(
+              appendFootnotes(loaded.content, annotations.footnotes),
+              annotations.comments,
+            );
+            const saved = await saveNote(
+              {
+                ...notesService.createSaveRequest(
+                  loaded.snapshot,
+                  storageContent,
+                ),
+                contentIsStorageSource: true,
+              },
+              queuedNoteId,
+              { preserveOptimisticAnnotations: true },
+            );
+            if (!saved) {
+              throw new Error("The annotation save did not return a document");
+            }
+            return saved;
+          },
+        },
       );
     },
     [saveNote],
@@ -621,6 +667,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         ...(commentsMapRef.current[noteId] || []),
         newComment,
       ];
+      commentsMapRef.current = {
+        ...commentsMapRef.current,
+        [noteId]: updatedComments,
+      };
       setCommentsMap((prev) => ({
         ...prev,
         [noteId]: updatedComments,
@@ -639,6 +689,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       const updatedComments = (
         commentsMapRef.current[noteId] || []
       ).filter((comment) => comment.id !== commentId);
+      commentsMapRef.current = {
+        ...commentsMapRef.current,
+        [noteId]: updatedComments,
+      };
       setCommentsMap((prev) => ({
         ...prev,
         [noteId]: updatedComments,
@@ -663,6 +717,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
             footnote.id === id ? { ...footnote, text } : footnote,
           )
         : [...currentFootnotes, { id, text }];
+      footnotesMapRef.current = {
+        ...footnotesMapRef.current,
+        [noteId]: updatedFootnotes,
+      };
       setFootnotesMap((prev) => ({
         ...prev,
         [noteId]: updatedFootnotes,
@@ -683,6 +741,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       ).map((footnote) =>
         footnote.id === id ? { ...footnote, text } : footnote,
       );
+      footnotesMapRef.current = {
+        ...footnotesMapRef.current,
+        [noteId]: updatedFootnotes,
+      };
       setFootnotesMap((prev) => ({
         ...prev,
         [noteId]: updatedFootnotes,
@@ -701,6 +763,10 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       const updatedFootnotes = (
         footnotesMapRef.current[noteId] || []
       ).filter((footnote) => footnote.id !== id);
+      footnotesMapRef.current = {
+        ...footnotesMapRef.current,
+        [noteId]: updatedFootnotes,
+      };
       setFootnotesMap((prev) => ({
         ...prev,
         [noteId]: updatedFootnotes,
