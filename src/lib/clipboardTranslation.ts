@@ -54,6 +54,8 @@ export function findClipboardImageItem<T extends ClipboardDataItemLike>(
 
 const blockHtmlPattern =
   /<(?:article|blockquote|div|h[1-6]|hr|li|ol|p|pre|table|tbody|td|th|thead|tr|ul)\b/i;
+const inlineHtmlPattern =
+  /<(?:a|b|br|code|del|em|i|mark|s|span|strike|strong|sub|sup|u)\b/i;
 const codeEditorWrapperPattern =
   /\b(?:ace_editor|CodeMirror|cm-editor|monaco-editor)\b/i;
 
@@ -135,7 +137,10 @@ function isCodeEditorHtmlWrapper(html: string, text: string): boolean {
 }
 
 function isMeaningfulHtml(html: string): boolean {
-  return blockHtmlPattern.test(html) && visibleHtmlText(html).length > 0;
+  return (
+    (blockHtmlPattern.test(html) || inlineHtmlPattern.test(html)) &&
+    visibleHtmlText(html).length > 0
+  );
 }
 
 export function selectClipboardTranslation(

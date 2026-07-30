@@ -53,6 +53,16 @@ export interface DocumentSaveFailure {
   currentHash?: string;
 }
 
+export function canAcceptDocumentInput({
+  isPreview,
+  settingsResolved,
+}: {
+  isPreview: boolean;
+  settingsResolved: boolean;
+}): boolean {
+  return isPreview || settingsResolved;
+}
+
 export function toSourceEditorText(content: string): string {
   return content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }

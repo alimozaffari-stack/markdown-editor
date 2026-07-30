@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import {
+  canAcceptDocumentInput,
   DocumentSession,
   toSourceEditorText,
   type DocumentProgrammaticEvent,
@@ -18,6 +19,33 @@ function snapshot(content = "# Original\r\n\r\nExact source\r\n"): DocumentSnaps
     lineEnding: "crlf",
   };
 }
+
+test("managed-note input stays locked until protection settings resolve", () => {
+  assert.equal(
+    canAcceptDocumentInput({
+      isPreview: false,
+      settingsResolved: false,
+    }),
+    false,
+  );
+  assert.equal(
+    canAcceptDocumentInput({
+      isPreview: false,
+      settingsResolved: true,
+    }),
+    true,
+  );
+});
+
+test("external-document preview input does not depend on note settings", () => {
+  assert.equal(
+    canAcceptDocumentInput({
+      isPreview: true,
+      settingsResolved: false,
+    }),
+    true,
+  );
+});
 
 for (const event of [
   "hydrate",

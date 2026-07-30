@@ -37,6 +37,7 @@ import {
   type ClipboardPayload,
 } from "../../lib/clipboardTranslation";
 import {
+  canAcceptDocumentInput,
   DocumentSession,
   toSourceEditorText,
   type DocumentSaveFailure,
@@ -858,6 +859,10 @@ export function Editor({
     settings?.preserveSourceFormattingNoteIds?.includes(
       currentNote?.id || "",
     ) || false;
+  const documentInputReady = canAcceptDocumentInput({
+    isPreview: Boolean(previewMode),
+    settingsResolved: settings !== null,
+  });
 
   useEffect(() => {
     const session = documentSessionRef.current;
@@ -1447,6 +1452,7 @@ export function Editor({
 
   const editor = useEditor({
     textDirection,
+    editable: documentInputReady,
     extensions: [
       ...createMarkdownSchemaExtensions({
         codeBlock: CodeBlockLowlight.extend({
@@ -1647,6 +1653,10 @@ export function Editor({
     // Prevent flash of unstyled content during initial render
     immediatelyRender: false,
   });
+
+  useEffect(() => {
+    editor?.setEditable(documentInputReady);
+  }, [documentInputReady, editor]);
 
   // Track which note's content is currently loaded in the editor
   const loadedNoteIdRef = useRef<string | null>(null);

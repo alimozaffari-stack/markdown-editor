@@ -58,6 +58,32 @@ test("meaningful Gemini HTML beats its flattened plain text", () => {
   );
 });
 
+test("inline-only rich HTML beats its flattened plain text", () => {
+  const html =
+    '<strong>Bold</strong> and <a href="https://example.com">linked</a>';
+
+  assert.deepEqual(
+    selectClipboardTranslation({
+      markdown: "",
+      html,
+      text: "Bold and linked",
+    }),
+    { kind: "html", value: html },
+  );
+
+  const dom = new JSDOM("<!doctype html><body></body>");
+  const schema = getSchema(createMarkdownSchemaExtensions());
+  const parsed = parseClipboardHtmlPreservingContent(
+    schema,
+    html,
+    dom.window.document,
+  );
+  const serialised = JSON.stringify(parsed);
+
+  assert.match(serialised, /"type":"bold"/);
+  assert.match(serialised, /"type":"link"/);
+});
+
 test("known code-editor HTML wrapper does not override literal Markdown", () => {
   const markdown = "## Heading\n\n1. one\n2. two";
   assert.deepEqual(
