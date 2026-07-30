@@ -17,6 +17,7 @@ use tokio::io::AsyncWriteExt;
 
 mod document;
 mod git;
+mod setting_paths;
 
 use document::{DocumentSnapshot, SaveDocumentRequest, SaveFailure, SaveFailureKind};
 
@@ -837,6 +838,32 @@ fn save_settings(notes_folder: &str, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+fn replace_note_setting_paths(settings: &mut Settings, old_id: &str, new_id: &str) {
+    setting_paths::replace_note_id(&mut settings.pinned_note_ids, old_id, new_id);
+    setting_paths::replace_note_id(
+        &mut settings.preserve_source_formatting_note_ids,
+        old_id,
+        new_id,
+    );
+}
+
+fn replace_folder_setting_paths(settings: &mut Settings, old_path: &str, new_path: &str) {
+    setting_paths::replace_folder_path(&mut settings.pinned_note_ids, old_path, new_path);
+    setting_paths::replace_folder_path(
+        &mut settings.preserve_source_formatting_note_ids,
+        old_path,
+        new_path,
+    );
+}
+
+fn save_settings_after_committed_path_change(notes_folder: &str, settings: &Settings) {
+    if let Err(error) = save_settings(notes_folder, settings) {
+        eprintln!(
+            "The path change was committed, but its migrated settings could not be saved: {error}"
+        );
+    }
+}
+
 // Clean up old entries from debounce map (entries older than 5 seconds)
 fn cleanup_debounce_map(map: &Mutex<HashMap<PathBuf, Instant>>) {
     let mut map = map.lock().expect("debounce map mutex");
@@ -1179,16 +1206,10 @@ async fn save_note(
     if final_id != existing_id {
         {
             let mut settings = state.settings.write().expect("settings write lock");
-            if let Some(ids) = settings.preserve_source_formatting_note_ids.as_mut() {
-                for note_id in ids {
-                    if *note_id == existing_id {
-                        *note_id = final_id.clone();
-                    }
-                }
-            }
+            replace_note_setting_paths(&mut settings, &existing_id, &final_id);
         }
         let settings = state.settings.read().expect("settings read lock");
-        save_settings(&folder, &settings).map_err(|error| error.to_string())?;
+        save_settings_after_committed_path_change(&folder, &settings);
 
         let mut cache = state.notes_cache.write().expect("cache write lock");
         cache.remove(&existing_id);
@@ -1578,20 +1599,11 @@ async fn rename_folder(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Update pinned note IDs in settings
+    // Keep per-document settings attached to notes inside the renamed folder.
     {
         let mut settings = state.settings.write().expect("settings write lock");
-        if let Some(ref mut pinned) = settings.pinned_note_ids {
-            for id in pinned.iter_mut() {
-                if id.starts_with(&old_prefix) {
-                    *id = format!("{}{}", new_prefix, &id[old_prefix.len()..]);
-                } else if *id == old_path {
-                    *id = new_path.clone();
-                }
-            }
-        }
-        // Save settings
-        let _ = save_settings(&folder, &settings);
+        replace_folder_setting_paths(&mut settings, &old_path, &new_path);
+        save_settings_after_committed_path_change(&folder, &settings);
     }
 
     // Update cache
@@ -1681,17 +1693,11 @@ async fn move_note(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Update pinned note IDs
+    // Keep per-document settings attached to the moved note.
     {
         let mut settings = state.settings.write().expect("settings write lock");
-        if let Some(ref mut pinned) = settings.pinned_note_ids {
-            for pin_id in pinned.iter_mut() {
-                if *pin_id == id {
-                    *pin_id = new_id.clone();
-                }
-            }
-        }
-        let _ = save_settings(&folder, &settings);
+        replace_note_setting_paths(&mut settings, &id, &new_id);
+        save_settings_after_committed_path_change(&folder, &settings);
     }
 
     // Update cache
@@ -1788,17 +1794,11 @@ async fn move_folder(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Update pinned note IDs
+    // Keep per-document settings attached to notes inside the moved folder.
     {
         let mut settings = state.settings.write().expect("settings write lock");
-        if let Some(ref mut pinned) = settings.pinned_note_ids {
-            for pin_id in pinned.iter_mut() {
-                if pin_id.starts_with(&old_prefix) {
-                    *pin_id = format!("{}{}", new_prefix, &pin_id[old_prefix.len()..]);
-                }
-            }
-        }
-        let _ = save_settings(&folder, &settings);
+        replace_folder_setting_paths(&mut settings, &path, &new_path);
+        save_settings_after_committed_path_change(&folder, &settings);
     }
 
     // Update cache
