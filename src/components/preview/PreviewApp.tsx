@@ -3,6 +3,10 @@ import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import { Editor, type PreviewModeData } from "../editor/Editor";
 import * as filesService from "../../services/files";
+import type {
+  DocumentSaveRequest,
+  DocumentSnapshot,
+} from "../../lib/documentLifecycle";
 
 interface PreviewAppProps {
   filePath: string;
@@ -22,6 +26,7 @@ export function PreviewApp({
   const [content, setContent] = useState<string | null>(null);
   const [title, setTitle] = useState("");
   const [modified, setModified] = useState(0);
+  const [snapshot, setSnapshot] = useState<DocumentSnapshot | null>(null);
   const [hasExternalChanges, setHasExternalChanges] = useState(false);
   const [reloadVersion, setReloadVersion] = useState(0);
   const recentlySavedRef = useRef(false);
@@ -29,6 +34,7 @@ export function PreviewApp({
   // Load file on mount
   useEffect(() => {
     setContent(null);
+    setSnapshot(null);
     setHasExternalChanges(false);
     filesService
       .readFileDirect(filePath)
@@ -36,6 +42,7 @@ export function PreviewApp({
         setContent(result.content);
         setTitle(result.title);
         setModified(result.modified);
+        setSnapshot(result.snapshot);
       })
       .catch((error) => {
         console.error("Failed to load file:", error);
@@ -65,18 +72,28 @@ export function PreviewApp({
   }, [filePath, modified, content]);
 
   const save = useCallback(
-    async (newContent: string) => {
+    async (request: DocumentSaveRequest): Promise<DocumentSnapshot> => {
       try {
-        const result = await filesService.saveFileDirect(filePath, newContent);
+        const result = await filesService.saveFileDirect(filePath, request);
         recentlySavedRef.current = true;
+        setContent(result.content);
         setModified(result.modified);
         setTitle(result.title);
+        setSnapshot(result.snapshot);
         setHasExternalChanges(false);
+        return result.snapshot;
       } catch (error) {
         console.error("Failed to save file:", error);
         toast.error(`Failed to save: ${error}`);
+        throw error;
       }
     },
+    [filePath],
+  );
+
+  const retainRecoveryDraft = useCallback(
+    (request: DocumentSaveRequest) =>
+      filesService.retainFileRecoveryDraft(filePath, request),
     [filePath],
   );
 
@@ -86,6 +103,7 @@ export function PreviewApp({
       setContent(result.content);
       setTitle(result.title);
       setModified(result.modified);
+      setSnapshot(result.snapshot);
       setHasExternalChanges(false);
       setReloadVersion((v) => v + 1);
     } catch (error) {
@@ -139,9 +157,11 @@ export function PreviewApp({
     title,
     filePath,
     modified,
+    snapshot,
     hasExternalChanges,
     reloadVersion,
     save,
+    retainRecoveryDraft,
     reload,
   };
 

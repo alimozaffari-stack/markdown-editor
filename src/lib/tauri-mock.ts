@@ -14,6 +14,56 @@ if (typeof window !== "undefined") {
       modified: number;
     }
 
+    interface MockDocumentSnapshot {
+      content: string;
+      hash: string;
+      revision: number;
+      encoding: "utf-8";
+      bom: "none";
+      lineEnding: "none" | "lf" | "crlf" | "cr" | "mixed";
+    }
+
+    const detectLineEnding = (
+      content: string,
+    ): MockDocumentSnapshot["lineEnding"] => {
+      const crlf = (content.match(/\r\n/g) || []).length;
+      const withoutCrlf = content.replace(/\r\n/g, "");
+      const lf = (withoutCrlf.match(/\n/g) || []).length;
+      const cr = (withoutCrlf.match(/\r/g) || []).length;
+      const kinds = [crlf > 0, lf > 0, cr > 0].filter(Boolean).length;
+      if (kinds > 1) return "mixed";
+      if (crlf > 0) return "crlf";
+      if (lf > 0) return "lf";
+      if (cr > 0) return "cr";
+      return "none";
+    };
+
+    const sha256 = async (content: string): Promise<string> => {
+      const digest = await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(content),
+      );
+      return Array.from(new Uint8Array(digest), (byte) =>
+        byte.toString(16).padStart(2, "0"),
+      ).join("");
+    };
+
+    const snapshotFor = async (
+      note: MockNote,
+    ): Promise<MockDocumentSnapshot> => ({
+      content: note.content,
+      hash: await sha256(note.content),
+      revision: note.modified * 1_000,
+      encoding: "utf-8",
+      bom: "none",
+      lineEnding: detectLineEnding(note.content),
+    });
+
+    const withSnapshot = async (note: MockNote) => ({
+      ...note,
+      snapshot: await snapshotFor(note),
+    });
+
     const defaultNotes: MockNote[] = [
       {
         id: "Welcome.md",
@@ -140,12 +190,28 @@ $$x^2 + y^2 = z^2$$`,
             if (!note) {
               throw new Error(`Note not found: ${args.id}`);
             }
-            return note;
+            return withSnapshot(note);
           }
           case "save_note": {
             const notes = getStoredNotes();
             let id = args.id;
-            const content = args.content || "";
+            const request = args.request;
+            const content = request?.content ?? args.content ?? "";
+            const existingIndex = notes.findIndex(n => n.id === id);
+            const existing =
+              existingIndex >= 0 ? notes[existingIndex] : undefined;
+
+            if (request && existing) {
+              const currentSnapshot = await snapshotFor(existing);
+              if (request.baselineHash !== currentSnapshot.hash) {
+                throw {
+                  kind: "conflict",
+                  message: "The document changed in browser storage",
+                  draftPath: null,
+                  currentHash: currentSnapshot.hash,
+                };
+              }
+            }
 
             // Extract title from first line or header
             let title = "Untitled";
@@ -164,7 +230,6 @@ $$x^2 + y^2 = z^2$$`,
               id = `${title.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "untitled"}.md`;
             }
 
-            const existingIndex = notes.findIndex(n => n.id === id);
             const updatedNote: MockNote = {
               id,
               title,
@@ -180,7 +245,17 @@ $$x^2 + y^2 = z^2$$`,
             }
 
             saveStoredNotes(notes);
-            return updatedNote;
+            return withSnapshot(updatedNote);
+          }
+          case "retain_note_recovery_draft": {
+            const request = args.request;
+            const baseline = String(request?.baselineHash ?? "unknown").slice(
+              0,
+              12,
+            );
+            const key = `markdown-editor:recovery:${args.id}:${baseline}`;
+            localStorage.setItem(key, request?.content ?? "");
+            return `browser-storage:${key}`;
           }
           case "delete_note": {
             let notes = getStoredNotes();
@@ -210,7 +285,7 @@ $$x^2 + y^2 = z^2$$`,
 
             notes.push(newNote);
             saveStoredNotes(notes);
-            return newNote;
+            return withSnapshot(newNote);
           }
 
           // Folders
@@ -354,7 +429,8 @@ $$x^2 + y^2 = z^2$$`,
               textDirection: "ltr",
               editorWidth: "normal",
               customEditorWidthPx: 768,
-              interfaceZoom: 1.0
+              interfaceZoom: 1.0,
+              preserveSourceFormattingNoteIds: []
             };
             localStorage.setItem("markdown-editor:settings", JSON.stringify(defaultSettings));
             return defaultSettings;
@@ -434,6 +510,11 @@ $$x^2 + y^2 = z^2$$`,
             }
             return;
           }
+          case "plugin:event|listen":
+            return args.handler;
+          case "plugin:event|unlisten":
+          case "plugin:event|emit":
+            return;
           // Unused or stub-only commands
           case "start_file_watcher":
           case "rebuild_search_index":
@@ -443,6 +524,9 @@ $$x^2 + y^2 = z^2$$`,
           case "plugin:window|minimize":
           case "plugin:window|maximize":
             return;
+
+          case "mark_main_ui_ready":
+            return [];
 
           case "get_cli_status":
             return { installed: false, path: null };

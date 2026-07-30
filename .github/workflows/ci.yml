@@ -32,7 +32,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy,rustfmt
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -42,8 +42,19 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Test frontend
+        run: npm test
+
       - name: Build frontend
         run: npm run build
+
+      - name: Cargo format
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: Cargo test
+        working-directory: src-tauri
+        run: cargo test
 
       - name: Cargo check
         working-directory: src-tauri

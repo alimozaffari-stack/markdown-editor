@@ -15,7 +15,11 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
+mod document;
 mod git;
+mod setting_paths;
+
+use document::{DocumentSnapshot, SaveDocumentRequest, SaveFailure, SaveFailureKind};
 
 // Note metadata for list display
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +45,9 @@ pub struct Note {
     pub content: String,
     pub path: String,
     pub modified: i64,
+    pub snapshot: DocumentSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 // Theme color customization
@@ -135,6 +142,8 @@ pub struct Settings {
     pub custom_colors_light: Option<std::collections::HashMap<String, String>>,
     #[serde(rename = "customColorsDark")]
     pub custom_colors_dark: Option<std::collections::HashMap<String, String>>,
+    #[serde(rename = "preserveSourceFormattingNoteIds")]
+    pub preserve_source_formatting_note_ids: Option<Vec<String>>,
 }
 
 // Search result
@@ -244,7 +253,7 @@ impl SearchIndex {
         // Parse query, fall back to prefix query if parsing fails
         let query = query_parser
             .parse_query(query_str)
-            .or_else(|_| query_parser.parse_query(&format!("{}*", query_str)))?;
+            .or_else(|_| query_parser.parse_query(&format!("{query_str}*")))?;
 
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
 
@@ -305,7 +314,7 @@ impl SearchIndex {
                     continue;
                 }
                 if let Some(id) = id_from_abs_path(notes_folder, file_path, ignored_dirs) {
-                    if let Ok(content) = std::fs::read_to_string(file_path) {
+                    if let Ok(content) = document::load_document_content(file_path) {
                         let modified = entry
                             .metadata()
                             .ok()
@@ -334,8 +343,8 @@ impl SearchIndex {
 
 // App state with improved structure
 pub struct AppState {
-    pub app_config: RwLock<AppConfig>,  // notes_folder path (stored in app data)
-    pub settings: RwLock<Settings>,      // per-folder settings (legacy .scratch/)
+    pub app_config: RwLock<AppConfig>, // notes_folder path (stored in app data)
+    pub settings: RwLock<Settings>,    // per-folder settings (legacy .scratch/)
     pub notes_cache: RwLock<HashMap<String, NoteMetadata>>,
     pub file_watcher: Mutex<Option<FileWatcherState>>,
     pub search_index: Mutex<Option<SearchIndex>>,
@@ -524,7 +533,12 @@ fn strip_markdown(text: &str) -> String {
     while let Some(start) = result.find("~~") {
         if let Some(end) = result[start + 2..].find("~~") {
             let inner = &result[start + 2..start + 2 + end];
-            result = format!("{}{}{}", &result[..start], inner, &result[start + 4 + end..]);
+            result = format!(
+                "{}{}{}",
+                &result[..start],
+                inner,
+                &result[start + 4 + end..]
+            );
         } else {
             break;
         }
@@ -534,7 +548,12 @@ fn strip_markdown(text: &str) -> String {
     while let Some(start) = result.find("**") {
         if let Some(end) = result[start + 2..].find("**") {
             let inner = &result[start + 2..start + 2 + end];
-            result = format!("{}{}{}", &result[..start], inner, &result[start + 4 + end..]);
+            result = format!(
+                "{}{}{}",
+                &result[..start],
+                inner,
+                &result[start + 4 + end..]
+            );
         } else {
             break;
         }
@@ -542,7 +561,12 @@ fn strip_markdown(text: &str) -> String {
     while let Some(start) = result.find("__") {
         if let Some(end) = result[start + 2..].find("__") {
             let inner = &result[start + 2..start + 2 + end];
-            result = format!("{}{}{}", &result[..start], inner, &result[start + 4 + end..]);
+            result = format!(
+                "{}{}{}",
+                &result[..start],
+                inner,
+                &result[start + 4 + end..]
+            );
         } else {
             break;
         }
@@ -552,7 +576,12 @@ fn strip_markdown(text: &str) -> String {
     while let Some(start) = result.find('`') {
         if let Some(end) = result[start + 1..].find('`') {
             let inner = &result[start + 1..start + 1 + end];
-            result = format!("{}{}{}", &result[..start], inner, &result[start + 2 + end..]);
+            result = format!(
+                "{}{}{}",
+                &result[..start],
+                inner,
+                &result[start + 2 + end..]
+            );
         } else {
             break;
         }
@@ -572,7 +601,12 @@ fn strip_markdown(text: &str) -> String {
         if let Some(end) = result[start + 1..].find('*') {
             if end > 0 {
                 let inner = &result[start + 1..start + 1 + end];
-                result = format!("{}{}{}", &result[..start], inner, &result[start + 2 + end..]);
+                result = format!(
+                    "{}{}{}",
+                    &result[..start],
+                    inner,
+                    &result[start + 2 + end..]
+                );
             } else {
                 break;
             }
@@ -585,7 +619,12 @@ fn strip_markdown(text: &str) -> String {
         if let Some(end) = result[start + 1..].find('_') {
             if end > 0 {
                 let inner = &result[start + 1..start + 1 + end];
-                result = format!("{}{}{}", &result[..start], inner, &result[start + 2 + end..]);
+                result = format!(
+                    "{}{}{}",
+                    &result[..start],
+                    inner,
+                    &result[start + 2 + end..]
+                );
             } else {
                 break;
             }
@@ -634,9 +673,10 @@ const DEFAULT_IGNORED_DIRS: &[&str] = &[
 
 /// Get the effective ignored directories from settings (or defaults if not customized).
 fn get_effective_ignored_dirs(settings: &Settings) -> Vec<String> {
-    settings.ignored_patterns.clone().unwrap_or_else(|| {
-        DEFAULT_IGNORED_DIRS.iter().map(|s| s.to_string()).collect()
-    })
+    settings
+        .ignored_patterns
+        .clone()
+        .unwrap_or_else(|| DEFAULT_IGNORED_DIRS.iter().map(|s| s.to_string()).collect())
 }
 
 /// Filter for WalkDir: skips excluded and user-ignored directories.
@@ -650,7 +690,11 @@ fn is_visible_notes_entry(entry: &walkdir::DirEntry, ignored_dirs: &[String]) ->
 
 /// Convert an absolute file path to a note ID (relative path from notes root, no .md extension, POSIX separators).
 /// Returns None if the path is outside the root, not a .md file, or in an excluded/ignored directory.
-fn id_from_abs_path(notes_root: &Path, file_path: &Path, ignored_dirs: &[String]) -> Option<String> {
+fn id_from_abs_path(
+    notes_root: &Path,
+    file_path: &Path,
+    ignored_dirs: &[String],
+) -> Option<String> {
     let rel = file_path.strip_prefix(notes_root).ok()?;
 
     // Skip files inside excluded or ignored directories.
@@ -673,7 +717,9 @@ fn id_from_abs_path(notes_root: &Path, file_path: &Path, ignored_dirs: &[String]
     // Strip .md by converting to string and trimming (avoids with_extension
     // which breaks on stems containing dots like "meeting.2024-01-15.md").
     let rel_str = rel.to_str()?;
-    let id = rel_str.strip_suffix(".md")?.replace(std::path::MAIN_SEPARATOR, "/");
+    let id = rel_str
+        .strip_suffix(".md")?
+        .replace(std::path::MAIN_SEPARATOR, "/");
 
     if id.is_empty() {
         None
@@ -724,6 +770,12 @@ fn get_app_config_path(app: &AppHandle) -> Result<PathBuf> {
     let app_data = app.path().app_data_dir()?;
     std::fs::create_dir_all(&app_data)?;
     Ok(app_data.join("config.json"))
+}
+
+fn get_document_recovery_path(app: &AppHandle) -> Result<PathBuf> {
+    let recovery = app.path().app_data_dir()?.join("document-recovery");
+    std::fs::create_dir_all(&recovery)?;
+    Ok(recovery)
 }
 
 // Get the compatible per-folder settings path.  Existing `.scratch` metadata
@@ -788,6 +840,32 @@ fn save_settings(notes_folder: &str, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+fn replace_note_setting_paths(settings: &mut Settings, old_id: &str, new_id: &str) {
+    setting_paths::replace_note_id(&mut settings.pinned_note_ids, old_id, new_id);
+    setting_paths::replace_note_id(
+        &mut settings.preserve_source_formatting_note_ids,
+        old_id,
+        new_id,
+    );
+}
+
+fn replace_folder_setting_paths(settings: &mut Settings, old_path: &str, new_path: &str) {
+    setting_paths::replace_folder_path(&mut settings.pinned_note_ids, old_path, new_path);
+    setting_paths::replace_folder_path(
+        &mut settings.preserve_source_formatting_note_ids,
+        old_path,
+        new_path,
+    );
+}
+
+fn save_settings_after_committed_path_change(notes_folder: &str, settings: &Settings) {
+    if let Err(error) = save_settings(notes_folder, settings) {
+        eprintln!(
+            "The path change was committed, but its migrated settings could not be saved: {error}"
+        );
+    }
+}
+
 // Clean up old entries from debounce map (entries older than 5 seconds)
 fn cleanup_debounce_map(map: &Mutex<HashMap<PathBuf, Instant>>) {
     let mut map = map.lock().expect("debounce map mutex");
@@ -804,7 +882,7 @@ fn normalize_notes_folder_path(path: &str) -> Result<PathBuf, String> {
 
     if trimmed.starts_with("file://") {
         let parsed = url::Url::parse(trimmed)
-            .map_err(|e| format!("Invalid file URL for notes folder: {}", e))?;
+            .map_err(|e| format!("Invalid file URL for notes folder: {e}"))?;
         return parsed
             .to_file_path()
             .map_err(|_| "Invalid file URL for notes folder".to_string());
@@ -816,7 +894,11 @@ fn normalize_notes_folder_path(path: &str) -> Result<PathBuf, String> {
 /// Shared initialization logic for setting a notes folder.
 /// Creates required directories, verifies write access, updates config/settings,
 /// adds asset protocol scope, and rebuilds the search index.
-fn initialize_notes_folder(app: &AppHandle, path_buf: &PathBuf, state: &AppState) -> Result<String, String> {
+fn initialize_notes_folder(
+    app: &AppHandle,
+    path_buf: &PathBuf,
+    state: &AppState,
+) -> Result<String, String> {
     let normalized_path = path_buf.to_string_lossy().into_owned();
 
     // Verify it's a valid directory
@@ -835,7 +917,7 @@ fn initialize_notes_folder(app: &AppHandle, path_buf: &PathBuf, state: &AppState
     // Verify write access early to avoid later silent failures
     let write_test_path = scratch_dir.join(".write-test");
     std::fs::write(&write_test_path, b"ok")
-        .map_err(|e| format!("Notes folder is not writable: {}", e))?;
+        .map_err(|e| format!("Notes folder is not writable: {e}"))?;
     let _ = std::fs::remove_file(&write_test_path);
 
     // Load per-folder settings (starts fresh with defaults if none exist)
@@ -932,7 +1014,7 @@ async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMetadata>, Str
                 continue;
             }
             if let Some(id) = id_from_abs_path(&path_clone, file_path, &ignored_dirs) {
-                if let Ok(content) = std::fs::read_to_string(file_path) {
+                if let Ok(content) = document::load_document_content(file_path) {
                     let modified = entry
                         .metadata()
                         .ok()
@@ -977,9 +1059,9 @@ async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMetadata>, Str
         let b_pinned = pinned_ids.contains(&b.id);
 
         match (a_pinned, b_pinned) {
-            (true, false) => std::cmp::Ordering::Less,    // a pinned, b not -> a first
+            (true, false) => std::cmp::Ordering::Less, // a pinned, b not -> a first
             (false, true) => std::cmp::Ordering::Greater, // b pinned, a not -> b first
-            _ => b.modified.cmp(&a.modified),             // both same status -> sort by date (newest first)
+            _ => b.modified.cmp(&a.modified), // both same status -> sort by date (newest first)
         }
     });
 
@@ -1011,12 +1093,9 @@ async fn read_note(id: String, state: State<'_, AppState>) -> Result<Note, Strin
         return Err("Note not found".to_string());
     }
 
-    let content = fs::read_to_string(&file_path)
-        .await
-        .map_err(|e| e.to_string())?;
-    let metadata = fs::metadata(&file_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let snapshot = document::load_document(&file_path).map_err(|error| error.message)?;
+    let content = snapshot.content.clone();
+    let metadata = fs::metadata(&file_path).await.map_err(|e| e.to_string())?;
 
     let modified = metadata
         .modified()
@@ -1031,15 +1110,56 @@ async fn read_note(id: String, state: State<'_, AppState>) -> Result<Note, Strin
         content,
         path: file_path.to_string_lossy().into_owned(),
         modified,
+        snapshot,
+        warning: None,
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CommittedHeadingRename {
+    id: String,
+    path: PathBuf,
+    warning: Option<String>,
+}
+
+fn reconcile_committed_heading_rename(
+    existing_id: &str,
+    desired_id: &str,
+    old_path: &Path,
+    desired_path: &Path,
+    rename_result: std::io::Result<()>,
+) -> CommittedHeadingRename {
+    if desired_id == existing_id {
+        return CommittedHeadingRename {
+            id: existing_id.to_string(),
+            path: old_path.to_path_buf(),
+            warning: None,
+        };
+    }
+
+    match rename_result {
+        Ok(()) => CommittedHeadingRename {
+            id: desired_id.to_string(),
+            path: desired_path.to_path_buf(),
+            warning: None,
+        },
+        Err(error) => CommittedHeadingRename {
+            id: existing_id.to_string(),
+            path: old_path.to_path_buf(),
+            warning: Some(format!(
+                "The content was saved under “{existing_id}”, but the note could not be renamed to “{desired_id}”: {error}"
+            )),
+        },
+    }
 }
 
 #[tauri::command]
 async fn save_note(
+    app: AppHandle,
     id: Option<String>,
-    content: String,
+    request: SaveDocumentRequest,
     state: State<'_, AppState>,
-) -> Result<Note, String> {
+) -> Result<Note, SaveFailure> {
     let folder = {
         let app_config = state.app_config.read().expect("app_config read lock");
         app_config
@@ -1048,76 +1168,66 @@ async fn save_note(
             .ok_or("Notes folder not set")?
     };
     let folder_path = PathBuf::from(&folder);
-
-    let title = extract_title(&content);
+    let existing_id = id.ok_or_else(|| {
+        SaveFailure::new(
+            SaveFailureKind::Validation,
+            "A note must be created before it can be saved",
+        )
+    })?;
+    let title = extract_title(&request.content);
     let sanitized_leaf = sanitize_filename(&title);
 
-    // Determine the file ID and path, handling renames
-    let (final_id, file_path, old_id) = if let Some(existing_id) = id {
-        // Preserve directory prefix for notes in subfolders
-        let (dir_prefix, desired_id) = if let Some(pos) = existing_id.rfind('/') {
-            let prefix = &existing_id[..pos];
-            (Some(prefix.to_string()), format!("{}/{}", prefix, sanitized_leaf))
-        } else {
-            (None, sanitized_leaf.clone())
-        };
-
-        let old_file_path = abs_path_from_id(&folder_path, &existing_id)?;
-
-        if existing_id != desired_id {
-            let mut new_id = desired_id.clone();
-            let mut counter = 1;
-
-            while new_id != existing_id
-                && abs_path_from_id(&folder_path, &new_id)
-                    .map(|p| p.exists())
-                    .unwrap_or(false)
-            {
-                new_id = if let Some(ref prefix) = dir_prefix {
-                    format!("{}/{}-{}", prefix, sanitized_leaf, counter)
-                } else {
-                    format!("{}-{}", sanitized_leaf, counter)
-                };
-                counter += 1;
-            }
-
-            let new_file_path = abs_path_from_id(&folder_path, &new_id)?;
-            (new_id, new_file_path, Some((existing_id, old_file_path)))
-        } else {
-            (existing_id, old_file_path, None)
-        }
+    // Preserve the directory prefix for notes in subfolders.
+    let (dir_prefix, desired_id) = if let Some(position) = existing_id.rfind('/') {
+        let prefix = &existing_id[..position];
+        (
+            Some(prefix.to_string()),
+            format!("{prefix}/{sanitized_leaf}"),
+        )
     } else {
-        // New notes go in root
-        let mut new_id = sanitized_leaf.clone();
-        let mut counter = 1;
-
-        while abs_path_from_id(&folder_path, &new_id)
-            .map(|p| p.exists())
-            .unwrap_or(false)
-        {
-            new_id = format!("{}-{}", sanitized_leaf, counter);
-            counter += 1;
-        }
-
-        let new_file_path = abs_path_from_id(&folder_path, &new_id)?;
-        (new_id, new_file_path, None)
+        (None, sanitized_leaf.clone())
     };
 
-    // Write the file to the new path
-    fs::write(&file_path, &content)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Delete old file AFTER successful write (to prevent data loss)
-    if let Some((_, ref old_file_path)) = old_id {
-        if old_file_path.exists() && *old_file_path != file_path {
-            let _ = fs::remove_file(old_file_path).await;
-        }
+    let mut final_id = desired_id;
+    let mut counter = 1;
+    while final_id != existing_id
+        && abs_path_from_id(&folder_path, &final_id)
+            .map(|path| path.exists())
+            .unwrap_or(false)
+    {
+        final_id = if let Some(ref prefix) = dir_prefix {
+            format!("{prefix}/{sanitized_leaf}-{counter}")
+        } else {
+            format!("{sanitized_leaf}-{counter}")
+        };
+        counter += 1;
     }
 
-    let metadata = fs::metadata(&file_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let old_file_path = abs_path_from_id(&folder_path, &existing_id)?;
+    if !old_file_path.is_file() {
+        return Err(SaveFailure::new(SaveFailureKind::Io, "Note not found"));
+    }
+    let recovery_directory = get_document_recovery_path(&app).map_err(|error| error.to_string())?;
+    let snapshot = document::save_document(&old_file_path, &recovery_directory, &request)?;
+
+    let desired_file_path = abs_path_from_id(&folder_path, &final_id)?;
+    let rename_result = if final_id == existing_id {
+        Ok(())
+    } else {
+        fs::rename(&old_file_path, &desired_file_path).await
+    };
+    let committed_path = reconcile_committed_heading_rename(
+        &existing_id,
+        &final_id,
+        &old_file_path,
+        &desired_file_path,
+        rename_result,
+    );
+    final_id = committed_path.id;
+    let file_path = committed_path.path;
+    let rename_warning = committed_path.warning;
+
+    let metadata = fs::metadata(&file_path).await.map_err(|e| e.to_string())?;
     let modified = metadata
         .modified()
         .ok()
@@ -1125,21 +1235,31 @@ async fn save_note(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    // Update search index (delete old entry if renamed, then add new)
+    let content = snapshot.content.clone();
+    let title = extract_title(&content);
+
+    // Update search index (delete the old entry if renamed, then add the new).
     {
         let index = state.search_index.lock().expect("search index mutex");
         if let Some(ref search_index) = *index {
-            if let Some((ref old_id_str, _)) = old_id {
-                let _ = search_index.delete_note(old_id_str);
+            if final_id != existing_id {
+                let _ = search_index.delete_note(&existing_id);
             }
             let _ = search_index.index_note(&final_id, &title, &content, modified);
         }
     }
 
-    // Update cache (remove old entry if renamed)
-    if let Some((ref old_id_str, _)) = old_id {
+    // Keep per-document settings attached to a note when its heading renames it.
+    if final_id != existing_id {
+        {
+            let mut settings = state.settings.write().expect("settings write lock");
+            replace_note_setting_paths(&mut settings, &existing_id, &final_id);
+        }
+        let settings = state.settings.read().expect("settings read lock");
+        save_settings_after_committed_path_change(&folder, &settings);
+
         let mut cache = state.notes_cache.write().expect("cache write lock");
-        cache.remove(old_id_str);
+        cache.remove(&existing_id);
     }
 
     Ok(Note {
@@ -1148,7 +1268,61 @@ async fn save_note(
         content,
         path: file_path.to_string_lossy().into_owned(),
         modified,
+        snapshot,
+        warning: rename_warning,
     })
+}
+
+#[cfg(test)]
+mod save_note_tests {
+    use super::*;
+
+    #[test]
+    fn failed_heading_rename_keeps_the_committed_note_identity() {
+        let old_path = PathBuf::from("/notes/Original.md");
+        let desired_path = PathBuf::from("/notes/Renamed.md");
+
+        let resolved = reconcile_committed_heading_rename(
+            "Original.md",
+            "Renamed.md",
+            &old_path,
+            &desired_path,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected rename denial",
+            )),
+        );
+
+        assert_eq!(resolved.id, "Original.md");
+        assert_eq!(resolved.path, old_path);
+        assert!(resolved
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("could not be renamed")));
+    }
+}
+
+#[tauri::command]
+async fn retain_note_recovery_draft(
+    app: AppHandle,
+    id: String,
+    request: SaveDocumentRequest,
+    state: State<'_, AppState>,
+) -> Result<String, SaveFailure> {
+    let folder = {
+        let app_config = state.app_config.read().expect("app_config read lock");
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
+    };
+    let target = abs_path_from_id(Path::new(&folder), &id)?;
+    if !target.is_file() {
+        return Err(SaveFailure::new(SaveFailureKind::Io, "Note not found"));
+    }
+    let recovery_directory = get_document_recovery_path(&app).map_err(|error| error.to_string())?;
+    let draft_path = document::retain_recovery_draft(&target, &recovery_directory, &request)?;
+    Ok(draft_path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -1187,7 +1361,10 @@ async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), Strin
 }
 
 #[tauri::command]
-async fn create_note(target_folder: Option<String>, state: State<'_, AppState>) -> Result<Note, String> {
+async fn create_note(
+    target_folder: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Note, String> {
     let folder = {
         let app_config = state.app_config.read().expect("app_config read lock");
         app_config
@@ -1242,7 +1419,7 @@ async fn create_note(target_folder: Option<String>, state: State<'_, AppState>) 
         if has_counter {
             final_id = sanitized.replace("{counter}", &counter.to_string());
         } else {
-            final_id = format!("{}-{}", base_id, counter);
+            final_id = format!("{base_id}-{counter}");
         }
         counter += 1;
     }
@@ -1250,7 +1427,7 @@ async fn create_note(target_folder: Option<String>, state: State<'_, AppState>) 
     // Extract display title from filename
     let display_title = extract_title_from_id(&final_id);
 
-    let content = format!("# {}\n\n", display_title);
+    let content = format!("# {display_title}\n\n");
     let file_path = abs_path_from_id(&folder_path, &final_id)?;
 
     // Create parent directories (for templates like {year}/{month}/{day})
@@ -1263,6 +1440,7 @@ async fn create_note(target_folder: Option<String>, state: State<'_, AppState>) 
     fs::write(&file_path, &content)
         .await
         .map_err(|e| e.to_string())?;
+    let snapshot = document::load_document(&file_path).map_err(|error| error.message)?;
 
     let modified = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1283,6 +1461,8 @@ async fn create_note(target_folder: Option<String>, state: State<'_, AppState>) 
         content,
         path: file_path.to_string_lossy().into_owned(),
         modified,
+        snapshot,
+        warning: None,
     })
 }
 
@@ -1311,7 +1491,7 @@ fn validate_folder_path(path: &str) -> Result<(), String> {
             std::path::Component::Normal(name) => {
                 if let Some(name_str) = name.to_str() {
                     if RESERVED_FOLDER_NAMES.contains(&name_str) {
-                        return Err(format!("'{}' is a reserved folder name", name_str));
+                        return Err(format!("'{name_str}' is a reserved folder name"));
                     }
                 }
             }
@@ -1359,7 +1539,7 @@ async fn list_folders(state: State<'_, AppState>) -> Result<Vec<String>, String>
         folders
     })
     .await
-    .map_err(|e| format!("Failed to list folders: {}", e))
+    .map_err(|e| format!("Failed to list folders: {e}"))
 }
 
 #[tauri::command]
@@ -1414,7 +1594,7 @@ async fn delete_folder(path: String, state: State<'_, AppState>) -> Result<(), S
         let index = state.search_index.lock().expect("search index mutex");
         if let Some(ref search_index) = *index {
             let cache = state.notes_cache.read().expect("cache read lock");
-            let prefix = format!("{}/", path);
+            let prefix = format!("{path}/");
             for note_id in cache.keys() {
                 if note_id.starts_with(&prefix) {
                     let _ = search_index.delete_note(note_id);
@@ -1426,7 +1606,7 @@ async fn delete_folder(path: String, state: State<'_, AppState>) -> Result<(), S
     // Remove notes from cache
     {
         let mut cache = state.notes_cache.write().expect("cache write lock");
-        let prefix = format!("{}/", path);
+        let prefix = format!("{path}/");
         cache.retain(|id, _| !id.starts_with(&prefix));
     }
 
@@ -1483,34 +1663,25 @@ async fn rename_folder(
     }
 
     // Compute old and new path prefixes for updating IDs
-    let old_prefix = format!("{}/", old_path);
+    let old_prefix = format!("{old_path}/");
     let new_path = if old_path.contains('/') {
         let parent = &old_path[..old_path.rfind('/').unwrap()];
-        format!("{}/{}", parent, sanitized_name)
+        format!("{parent}/{sanitized_name}")
     } else {
         sanitized_name.clone()
     };
-    let new_prefix = format!("{}/", new_path);
+    let new_prefix = format!("{new_path}/");
 
     // Rename on disk
     tokio::fs::rename(&old_target, &new_target)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Update pinned note IDs in settings
+    // Keep per-document settings attached to notes inside the renamed folder.
     {
         let mut settings = state.settings.write().expect("settings write lock");
-        if let Some(ref mut pinned) = settings.pinned_note_ids {
-            for id in pinned.iter_mut() {
-                if id.starts_with(&old_prefix) {
-                    *id = format!("{}{}", new_prefix, &id[old_prefix.len()..]);
-                } else if *id == old_path {
-                    *id = new_path.clone();
-                }
-            }
-        }
-        // Save settings
-        let _ = save_settings(&folder, &settings);
+        replace_folder_setting_paths(&mut settings, &old_path, &new_path);
+        save_settings_after_committed_path_change(&folder, &settings);
     }
 
     // Update cache
@@ -1575,7 +1746,7 @@ async fn move_note(
         leaf.to_string()
     } else {
         validate_folder_path(&target_folder)?;
-        format!("{}/{}", target_folder, leaf)
+        format!("{target_folder}/{leaf}")
     };
 
     if new_id == id {
@@ -1586,7 +1757,9 @@ async fn move_note(
 
     // Ensure target directory exists
     if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
     // Handle collision
@@ -1598,17 +1771,11 @@ async fn move_note(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Update pinned note IDs
+    // Keep per-document settings attached to the moved note.
     {
         let mut settings = state.settings.write().expect("settings write lock");
-        if let Some(ref mut pinned) = settings.pinned_note_ids {
-            for pin_id in pinned.iter_mut() {
-                if *pin_id == id {
-                    *pin_id = new_id.clone();
-                }
-            }
-        }
-        let _ = save_settings(&folder, &settings);
+        replace_note_setting_paths(&mut settings, &id, &new_id);
+        save_settings_after_committed_path_change(&folder, &settings);
     }
 
     // Update cache
@@ -1687,33 +1854,29 @@ async fn move_folder(
 
     // Ensure target parent exists
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
     // Compute old and new path prefixes for updating IDs
-    let old_prefix = format!("{}/", path);
+    let old_prefix = format!("{path}/");
     let new_path = if target_parent.is_empty() {
         name.clone()
     } else {
-        format!("{}/{}", target_parent, name)
+        format!("{target_parent}/{name}")
     };
-    let new_prefix = format!("{}/", new_path);
+    let new_prefix = format!("{new_path}/");
 
     tokio::fs::rename(&source, &dest)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Update pinned note IDs
+    // Keep per-document settings attached to notes inside the moved folder.
     {
         let mut settings = state.settings.write().expect("settings write lock");
-        if let Some(ref mut pinned) = settings.pinned_note_ids {
-            for pin_id in pinned.iter_mut() {
-                if pin_id.starts_with(&old_prefix) {
-                    *pin_id = format!("{}{}", new_prefix, &pin_id[old_prefix.len()..]);
-                }
-            }
-        }
-        let _ = save_settings(&folder, &settings);
+        replace_folder_setting_paths(&mut settings, &path, &new_path);
+        save_settings_after_committed_path_change(&folder, &settings);
     }
 
     // Update cache
@@ -1756,13 +1919,13 @@ fn get_settings(state: State<AppState>) -> Settings {
 }
 
 #[tauri::command]
-fn update_settings(
-    new_settings: Settings,
-    state: State<AppState>,
-) -> Result<(), String> {
+fn update_settings(new_settings: Settings, state: State<AppState>) -> Result<(), String> {
     let folder = {
         let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
     };
 
     {
@@ -1784,7 +1947,10 @@ fn update_git_enabled(
 ) -> Result<(), String> {
     let folder = {
         let app_config = state.app_config.read().expect("app_config read lock");
-        let folder = app_config.notes_folder.clone().ok_or("Notes folder not set")?;
+        let folder = app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?;
 
         if folder != expected_folder {
             return Err("Notes folder changed".to_string());
@@ -1833,6 +1999,7 @@ pub struct FileContent {
     pub content: String,
     pub title: String,
     pub modified: i64,
+    pub snapshot: DocumentSnapshot,
 }
 
 /// Validate a file path for preview mode direct file operations.
@@ -1849,7 +2016,7 @@ fn validate_preview_path(path: &str) -> Result<PathBuf, String> {
     // Resolve symlinks to get the real path
     let canonical = file_path
         .canonicalize()
-        .map_err(|e| format!("Cannot resolve file path: {}", e))?;
+        .map_err(|e| format!("Cannot resolve file path: {e}"))?;
 
     Ok(canonical)
 }
@@ -1859,12 +2026,11 @@ async fn read_file_direct(path: String) -> Result<FileContent, String> {
     let canonical = validate_preview_path(&path)?;
 
     if !canonical.is_file() {
-        return Err(format!("Not a file: {}", path));
+        return Err(format!("Not a file: {path}"));
     }
 
-    let content = fs::read_to_string(&canonical)
-        .await
-        .map_err(|_| "Failed to read file".to_string())?;
+    let snapshot = document::load_document(&canonical).map_err(|error| error.message)?;
+    let content = snapshot.content.clone();
     let metadata = fs::metadata(&canonical)
         .await
         .map_err(|_| "Failed to read metadata".to_string())?;
@@ -1883,21 +2049,26 @@ async fn read_file_direct(path: String) -> Result<FileContent, String> {
         content,
         title,
         modified,
+        snapshot,
     })
 }
 
 #[tauri::command]
-async fn save_file_direct(path: String, content: String) -> Result<FileContent, String> {
+async fn save_file_direct(
+    app: AppHandle,
+    path: String,
+    request: SaveDocumentRequest,
+) -> Result<FileContent, SaveFailure> {
     // For save, the file must already exist (we validate extension + path security)
     let canonical = validate_preview_path(&path)?;
 
     if !canonical.is_file() {
-        return Err(format!("Not a file: {}", path));
+        return Err(format!("Not a file: {path}").into());
     }
 
-    fs::write(&canonical, &content)
-        .await
-        .map_err(|_| "Failed to write file".to_string())?;
+    let recovery_directory = get_document_recovery_path(&app).map_err(|error| error.to_string())?;
+    let snapshot = document::save_document(&canonical, &recovery_directory, &request)?;
+    let content = snapshot.content.clone();
 
     let metadata = fs::metadata(&canonical)
         .await
@@ -1916,17 +2087,35 @@ async fn save_file_direct(path: String, content: String) -> Result<FileContent, 
         content,
         title,
         modified,
+        snapshot,
     })
 }
 
 #[tauri::command]
-async fn import_file_to_folder(
+async fn retain_file_recovery_draft(
     app: AppHandle,
     path: String,
-) -> Result<NoteMetadata, String> {
+    request: SaveDocumentRequest,
+) -> Result<String, SaveFailure> {
+    let target = validate_preview_path(&path)?;
+    if !target.is_file() {
+        return Err(format!("Not a file: {path}").into());
+    }
+    let recovery_directory = get_document_recovery_path(&app).map_err(|error| error.to_string())?;
+    let draft_path = document::retain_recovery_draft(&target, &recovery_directory, &request)?;
+    Ok(draft_path.to_string_lossy().into_owned())
+}
+
+fn load_import_source_content(source: &Path) -> Result<String, String> {
+    document::load_document_content(source)
+        .map_err(|error| format!("Failed to read source file: {}", error.message))
+}
+
+#[tauri::command]
+async fn import_file_to_folder(app: AppHandle, path: String) -> Result<NoteMetadata, String> {
     let source = validate_preview_path(&path)?;
     if !source.is_file() {
-        return Err(format!("Not a file: {}", path));
+        return Err(format!("Not a file: {path}"));
     }
 
     let folder = {
@@ -1939,10 +2128,8 @@ async fn import_file_to_folder(
     };
     let folder_path = PathBuf::from(&folder);
 
-    // Read the source file content
-    let content = fs::read_to_string(&source)
-        .await
-        .map_err(|_| "Failed to read source file".to_string())?;
+    // Use the same BOM-aware decoder as preview and managed-note discovery.
+    let content = load_import_source_content(&source)?;
 
     // Derive the note ID from the title (H1 heading), falling back to filename
     let extracted_title = extract_title(&content);
@@ -1977,12 +2164,12 @@ async fn import_file_to_folder(
                 break;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                final_id = format!("{}-{}", base_id, counter);
+                final_id = format!("{base_id}-{counter}");
                 counter += 1;
             }
             Err(_) => return Err("Failed to create file".to_string()),
         }
-    };
+    }
 
     let modified = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2029,8 +2216,40 @@ async fn import_file_to_folder(
     Ok(metadata)
 }
 
+#[cfg(test)]
+mod import_source_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn utf16le_bytes(content: &str) -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xfe];
+        for code_unit in content.encode_utf16() {
+            bytes.extend_from_slice(&code_unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn import_source_loader_decodes_bom_marked_utf16() {
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("external.md");
+        std::fs::write(
+            &source,
+            utf16le_bytes("# Imported UTF-16\n\nExact source ✓\n"),
+        )
+        .expect("UTF-16 fixture");
+
+        let content = load_import_source_content(&source).expect("decoded import source");
+
+        assert_eq!(content, "# Imported UTF-16\n\nExact source ✓\n");
+    }
+}
+
 #[tauri::command]
-async fn search_notes(query: String, state: State<'_, AppState>) -> Result<Vec<SearchResult>, String> {
+async fn search_notes(
+    query: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<SearchResult>, String> {
     let trimmed_query = query.trim().to_string();
     if trimmed_query.is_empty() {
         return Ok(vec![]);
@@ -2040,7 +2259,9 @@ async fn search_notes(query: String, state: State<'_, AppState>) -> Result<Vec<S
     let indexed_result = {
         let index = state.search_index.lock().expect("search index mutex");
         (*index).as_ref().map(|search_index| {
-            search_index.search(&trimmed_query, 20).map_err(|e| e.to_string())
+            search_index
+                .search(&trimmed_query, 20)
+                .map_err(|e| e.to_string())
         })
     };
 
@@ -2051,7 +2272,7 @@ async fn search_notes(query: String, state: State<'_, AppState>) -> Result<Vec<S
             fallback_search(&trimmed_query, &state).await
         }
         Some(Err(e)) => {
-            eprintln!("Tantivy search error, falling back to substring search: {}", e);
+            eprintln!("Tantivy search error, falling back to substring search: {e}");
             fallback_search(&trimmed_query, &state).await
         }
         None => {
@@ -2062,7 +2283,10 @@ async fn search_notes(query: String, state: State<'_, AppState>) -> Result<Vec<S
 }
 
 // Fallback search when Tantivy index isn't available - searches title and full content
-async fn fallback_search(query: &str, state: &State<'_, AppState>) -> Result<Vec<SearchResult>, String> {
+async fn fallback_search(
+    query: &str,
+    state: &State<'_, AppState>,
+) -> Result<Vec<SearchResult>, String> {
     let folder = {
         let app_config = state.app_config.read().expect("app_config read lock");
         app_config.notes_folder.clone()
@@ -2106,7 +2330,7 @@ async fn fallback_search(query: &str, state: &State<'_, AppState>) -> Result<Vec
             Ok(p) => p,
             Err(_) => continue,
         };
-        if let Ok(content) = tokio::fs::read_to_string(&file_path).await {
+        if let Ok(content) = document::load_document_content(&file_path) {
             let content_lower = content.to_lowercase();
             if content_lower.contains(&query_lower) {
                 // Higher score if in title, lower if only in content
@@ -2129,7 +2353,11 @@ async fn fallback_search(query: &str, state: &State<'_, AppState>) -> Result<Vec
         }
     }
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results.truncate(20);
 
     Ok(results)
@@ -2175,7 +2403,9 @@ fn setup_file_watcher(
                         let now = Instant::now();
 
                         if map.len() > 100 {
-                            map.retain(|_, last| now.duration_since(*last) < Duration::from_secs(5));
+                            map.retain(|_, last| {
+                                now.duration_since(*last) < Duration::from_secs(5)
+                            });
                         }
 
                         if let Some(last) = map.get(path) {
@@ -2201,16 +2431,19 @@ fn setup_file_watcher(
                         if let Some(ref search_index) = *index {
                             match kind {
                                 "created" | "modified" => {
-                                    match std::fs::read_to_string(path) {
+                                    match document::load_document_content(path) {
                                         Ok(content) => {
                                             let title = extract_title(&content);
                                             let modified = std::fs::metadata(path)
                                                 .ok()
                                                 .and_then(|m| m.modified().ok())
-                                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                                .and_then(|t| {
+                                                    t.duration_since(std::time::UNIX_EPOCH).ok()
+                                                })
                                                 .map(|d| d.as_secs() as i64)
                                                 .unwrap_or(0);
-                                            let _ = search_index.index_note(&note_id, &title, &content, modified);
+                                            let _ = search_index
+                                                .index_note(&note_id, &title, &content, modified);
                                         }
                                         Err(_) => {
                                             // File gone between event and read — treat as deletion
@@ -2274,11 +2507,7 @@ fn start_file_watcher(app: AppHandle, state: State<AppState>) -> Result<(), Stri
     // Clean up debounce map before starting
     cleanup_debounce_map(&state.debounce_map);
 
-    let watcher_state = setup_file_watcher(
-        app,
-        &folder,
-        Arc::clone(&state.debounce_map),
-    )?;
+    let watcher_state = setup_file_watcher(app, &folder, Arc::clone(&state.debounce_map))?;
 
     let mut file_watcher = state.file_watcher.lock().expect("file watcher mutex");
     *file_watcher = Some(watcher_state);
@@ -2331,12 +2560,12 @@ async fn save_clipboard_image(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let mut target_name = format!("screenshot-{}.png", timestamp);
+    let mut target_name = format!("screenshot-{timestamp}.png");
     let mut counter = 1;
     let mut target_path = assets_dir.join(&target_name);
 
     while target_path.exists() {
-        target_name = format!("screenshot-{}-{}.png", timestamp, counter);
+        target_name = format!("screenshot-{timestamp}-{counter}.png");
         target_path = assets_dir.join(&target_name);
         counter += 1;
     }
@@ -2347,7 +2576,7 @@ async fn save_clipboard_image(
         .map_err(|_| "Failed to write image".to_string())?;
 
     // Return relative path
-    Ok(format!("assets/{}", target_name))
+    Ok(format!("assets/{target_name}"))
 }
 
 #[tauri::command]
@@ -2398,12 +2627,12 @@ async fn copy_image_to_assets(
         .map_err(|e| e.to_string())?;
 
     // Generate unique filename
-    let mut target_name = format!("{}.{}", sanitized_name, extension);
+    let mut target_name = format!("{sanitized_name}.{extension}");
     let mut counter = 1;
     let mut target_path = assets_dir.join(&target_name);
 
     while target_path.exists() {
-        target_name = format!("{}-{}.{}", sanitized_name, counter, extension);
+        target_name = format!("{sanitized_name}-{counter}.{extension}");
         target_path = assets_dir.join(&target_name);
         counter += 1;
     }
@@ -2414,7 +2643,7 @@ async fn copy_image_to_assets(
         .map_err(|_| "Failed to copy image".to_string())?;
 
     // Return both relative path and filename for frontend to construct the URL
-    Ok(format!("assets/{}", target_name))
+    Ok(format!("assets/{target_name}"))
 }
 
 #[tauri::command]
@@ -2466,7 +2695,7 @@ async fn open_folder_dialog(
         builder.blocking_pick_folder()
     })
     .await
-    .map_err(|e| format!("Dialog task failed: {}", e))?;
+    .map_err(|e| format!("Dialog task failed: {e}"))?;
 
     Ok(result.map(|p| p.to_string()))
 }
@@ -2514,20 +2743,19 @@ async fn open_in_file_manager(path: String) -> Result<(), String> {
 #[tauri::command]
 async fn open_url_safe(url: String) -> Result<(), String> {
     // Validate URL scheme - only allow http, https, mailto
-    let parsed = url::Url::parse(&url).map_err(|e| format!("Invalid URL: {}", e))?;
+    let parsed = url::Url::parse(&url).map_err(|e| format!("Invalid URL: {e}"))?;
 
     match parsed.scheme() {
         "http" | "https" | "mailto" => {}
         scheme => {
             return Err(format!(
-                "URL scheme '{}' is not allowed. Only http, https, and mailto are permitted.",
-                scheme
+                "URL scheme '{scheme}' is not allowed. Only http, https, and mailto are permitted."
             ))
         }
     }
 
     // Use system opener
-    open::that(&url).map_err(|e| format!("Failed to open URL: {}", e))
+    open::that(&url).map_err(|e| format!("Failed to open URL: {e}"))
 }
 
 // Git commands - run blocking git operations off the main thread
@@ -2548,11 +2776,9 @@ async fn git_get_status(state: State<'_, AppState>) -> Result<git::GitStatus, St
 
     match folder {
         Some(path) => {
-            tauri::async_runtime::spawn_blocking(move || {
-                git::get_status(&PathBuf::from(path))
-            })
-            .await
-            .map_err(|e| e.to_string())
+            tauri::async_runtime::spawn_blocking(move || git::get_status(&PathBuf::from(path)))
+                .await
+                .map_err(|e| e.to_string())
         }
         None => Ok(git::GitStatus::default()),
     }
@@ -2562,14 +2788,15 @@ async fn git_get_status(state: State<'_, AppState>) -> Result<git::GitStatus, St
 async fn git_init_repo(state: State<'_, AppState>) -> Result<(), String> {
     let folder = {
         let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
     };
 
-    tauri::async_runtime::spawn_blocking(move || {
-        git::git_init(&PathBuf::from(folder))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || git::git_init(&PathBuf::from(folder)))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2580,13 +2807,11 @@ async fn git_commit(message: String, state: State<'_, AppState>) -> Result<git::
     };
 
     match folder {
-        Some(path) => {
-            tauri::async_runtime::spawn_blocking(move || {
-                git::commit_all(&PathBuf::from(path), &message)
-            })
-            .await
-            .map_err(|e| e.to_string())
-        }
+        Some(path) => tauri::async_runtime::spawn_blocking(move || {
+            git::commit_all(&PathBuf::from(path), &message)
+        })
+        .await
+        .map_err(|e| e.to_string()),
         None => Ok(git::GitResult {
             success: false,
             message: None,
@@ -2603,13 +2828,9 @@ async fn git_push(state: State<'_, AppState>) -> Result<git::GitResult, String> 
     };
 
     match folder {
-        Some(path) => {
-            tauri::async_runtime::spawn_blocking(move || {
-                git::push(&PathBuf::from(path))
-            })
+        Some(path) => tauri::async_runtime::spawn_blocking(move || git::push(&PathBuf::from(path)))
             .await
-            .map_err(|e| e.to_string())
-        }
+            .map_err(|e| e.to_string()),
         None => Ok(git::GitResult {
             success: false,
             message: None,
@@ -2627,11 +2848,9 @@ async fn git_fetch(state: State<'_, AppState>) -> Result<git::GitResult, String>
 
     match folder {
         Some(path) => {
-            tauri::async_runtime::spawn_blocking(move || {
-                git::fetch(&PathBuf::from(path))
-            })
-            .await
-            .map_err(|e| e.to_string())
+            tauri::async_runtime::spawn_blocking(move || git::fetch(&PathBuf::from(path)))
+                .await
+                .map_err(|e| e.to_string())
         }
         None => Ok(git::GitResult {
             success: false,
@@ -2649,13 +2868,9 @@ async fn git_pull(state: State<'_, AppState>) -> Result<git::GitResult, String> 
     };
 
     match folder {
-        Some(path) => {
-            tauri::async_runtime::spawn_blocking(move || {
-                git::pull(&PathBuf::from(path))
-            })
+        Some(path) => tauri::async_runtime::spawn_blocking(move || git::pull(&PathBuf::from(path)))
             .await
-            .map_err(|e| e.to_string())
-        }
+            .map_err(|e| e.to_string()),
         None => Ok(git::GitResult {
             success: false,
             message: None,
@@ -2672,13 +2887,11 @@ async fn git_add_remote(url: String, state: State<'_, AppState>) -> Result<git::
     };
 
     match folder {
-        Some(path) => {
-            tauri::async_runtime::spawn_blocking(move || {
-                git::add_remote(&PathBuf::from(path), &url)
-            })
-            .await
-            .map_err(|e| e.to_string())
-        }
+        Some(path) => tauri::async_runtime::spawn_blocking(move || {
+            git::add_remote(&PathBuf::from(path), &url)
+        })
+        .await
+        .map_err(|e| e.to_string()),
         None => Ok(git::GitResult {
             success: false,
             message: None,
@@ -2688,20 +2901,21 @@ async fn git_add_remote(url: String, state: State<'_, AppState>) -> Result<git::
 }
 
 #[tauri::command]
-async fn git_set_remote_url(url: String, state: State<'_, AppState>) -> Result<git::GitResult, String> {
+async fn git_set_remote_url(
+    url: String,
+    state: State<'_, AppState>,
+) -> Result<git::GitResult, String> {
     let folder = {
         let app_config = state.app_config.read().expect("app_config read lock");
         app_config.notes_folder.clone()
     };
 
     match folder {
-        Some(path) => {
-            tauri::async_runtime::spawn_blocking(move || {
-                git::set_remote_url(&PathBuf::from(path), &url)
-            })
-            .await
-            .map_err(|e| e.to_string())
-        }
+        Some(path) => tauri::async_runtime::spawn_blocking(move || {
+            git::set_remote_url(&PathBuf::from(path), &url)
+        })
+        .await
+        .map_err(|e| e.to_string()),
         None => Ok(git::GitResult {
             success: false,
             message: None,
@@ -2719,11 +2933,9 @@ async fn git_remove_remote(state: State<'_, AppState>) -> Result<git::GitResult,
 
     match folder {
         Some(path) => {
-            tauri::async_runtime::spawn_blocking(move || {
-                git::remove_remote(&PathBuf::from(path))
-            })
-            .await
-            .map_err(|e| e.to_string())
+            tauri::async_runtime::spawn_blocking(move || git::remove_remote(&PathBuf::from(path)))
+                .await
+                .map_err(|e| e.to_string())
         }
         None => Ok(git::GitResult {
             success: false,
@@ -2747,10 +2959,9 @@ async fn git_push_with_upstream(state: State<'_, AppState>) -> Result<git::GitRe
                 let status = git::get_status(&PathBuf::from(&path));
                 match status.current_branch {
                     Some(branch) => {
-                        if !branch
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
-                        {
+                        if !branch.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')
+                        }) {
                             return git::GitResult {
                                 success: false,
                                 message: None,
@@ -2850,7 +3061,7 @@ fn check_cli_exists(command_name: &str, path: &str) -> Result<bool, String> {
         .arg(command_name)
         .env("PATH", path)
         .output()
-        .map_err(|e| format!("Failed to check for {} CLI: {}", command_name, e))?;
+        .map_err(|e| format!("Failed to check for {command_name} CLI: {e}"))?;
 
     Ok(check_output.status.success())
 }
@@ -2882,26 +3093,42 @@ fn cli_target_path() -> PathBuf {
 #[tauri::command]
 fn get_cli_status() -> Result<CliStatus, String> {
     #[cfg(not(target_os = "macos"))]
-    return Ok(CliStatus { supported: false, installed: false, path: None });
+    return Ok(CliStatus {
+        supported: false,
+        installed: false,
+        path: None,
+    });
 
     #[cfg(target_os = "macos")]
     {
         let target = cli_target_path();
         if !target.exists() && target.symlink_metadata().is_err() {
-            return Ok(CliStatus { supported: true, installed: false, path: None });
+            return Ok(CliStatus {
+                supported: true,
+                installed: false,
+                path: None,
+            });
         }
         // Verify this is our wrapper (has marker) and points to the current binary
         let content = std::fs::read_to_string(&target).unwrap_or_default();
         if !content.contains(MARKDOWN_EDITOR_CLI_MARKER) {
             // Foreign binary at this path — don't claim it as ours
-            return Ok(CliStatus { supported: true, installed: false, path: None });
+            return Ok(CliStatus {
+                supported: true,
+                installed: false,
+                path: None,
+            });
         }
         let current_exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         if !current_exe.is_empty() && !content.contains(&current_exe) {
             // Our wrapper but points to a moved/deleted binary — needs reinstall
-            return Ok(CliStatus { supported: true, installed: false, path: None });
+            return Ok(CliStatus {
+                supported: true,
+                installed: false,
+                path: None,
+            });
         }
         Ok(CliStatus {
             supported: true,
@@ -2940,8 +3167,8 @@ fn install_cli() -> Result<String, String> {
                 .map_err(|e| format!("Failed to remove existing file: {}", e))?;
         }
 
-        let exe_path = std::env::current_exe()
-            .map_err(|e| format!("Cannot find exe path: {}", e))?;
+        let exe_path =
+            std::env::current_exe().map_err(|e| format!("Cannot find exe path: {}", e))?;
 
         // Shell-escape the exe path using single quotes to prevent
         // interpretation of $, `, ", and other metacharacters.
@@ -2952,8 +3179,7 @@ fn install_cli() -> Result<String, String> {
         // the terminal is not blocked waiting for the GUI app to exit.
         let script = format!(
             "#!/bin/sh\n{}\nnohup {} \"$@\" >/dev/null 2>&1 &\n",
-            MARKDOWN_EDITOR_CLI_MARKER,
-            escaped_exe
+            MARKDOWN_EDITOR_CLI_MARKER, escaped_exe
         );
         std::fs::write(&target, script.as_bytes())
             .map_err(|e| format!("Failed to write CLI script: {}", e))?;
@@ -2999,7 +3225,7 @@ async fn ai_check_claude_cli() -> Result<bool, String> {
         check_cli_exists("claude", &path)
     })
     .await
-    .map_err(|e| format!("Failed to check Claude CLI: {}", e))?
+    .map_err(|e| format!("Failed to check Claude CLI: {e}"))?
 }
 
 #[tauri::command]
@@ -3009,7 +3235,7 @@ async fn ai_check_codex_cli() -> Result<bool, String> {
         check_cli_exists("codex", &path)
     })
     .await
-    .map_err(|e| format!("Failed to check Codex CLI: {}", e))?
+    .map_err(|e| format!("Failed to check Codex CLI: {e}"))?
 }
 
 #[tauri::command]
@@ -3019,7 +3245,7 @@ async fn ai_check_opencode_cli() -> Result<bool, String> {
         check_cli_exists("opencode", &path)
     })
     .await
-    .map_err(|e| format!("Failed to check OpenCode CLI: {}", e))?
+    .map_err(|e| format!("Failed to check OpenCode CLI: {e}"))?
 }
 
 #[tauri::command]
@@ -3029,7 +3255,7 @@ async fn ai_check_ollama_cli() -> Result<bool, String> {
         check_cli_exists("ollama", &path)
     })
     .await
-    .map_err(|e| format!("Failed to check Ollama CLI: {}", e))?
+    .map_err(|e| format!("Failed to check Ollama CLI: {e}"))?
 }
 
 /// Shared AI CLI execution: spawns `command` with `args`, writes `stdin_input` to stdin,
@@ -3097,7 +3323,7 @@ async fn execute_ai_cli(
                 return AiExecutionResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Failed to execute {}: {}", cli_name_task, e)),
+                    error: Some(format!("Failed to execute {cli_name_task}: {e}")),
                 };
             }
         };
@@ -3111,7 +3337,7 @@ async fn execute_ai_cli(
             return AiExecutionResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Failed to lock {} process handle", cli_name_task)),
+                error: Some(format!("Failed to lock {cli_name_task} process handle")),
             };
         }
 
@@ -3132,7 +3358,7 @@ async fn execute_ai_cli(
                 return AiExecutionResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Failed to write to {} stdin: {}", cli_name_task, e)),
+                    error: Some(format!("Failed to write to {cli_name_task} stdin: {e}")),
                 };
             }
             // stdin dropped here — closes the pipe
@@ -3146,7 +3372,7 @@ async fn execute_ai_cli(
             return AiExecutionResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Failed to open stdin for {}", cli_name_task)),
+                error: Some(format!("Failed to open stdin for {cli_name_task}")),
             };
         }
 
@@ -3203,7 +3429,7 @@ async fn execute_ai_cli(
 
     let result = match tokio::time::timeout(timeout_duration, &mut task).await {
         Ok(join_result) => {
-            join_result.map_err(|e| format!("Failed to join {} blocking task: {}", cli_name, e))?
+            join_result.map_err(|e| format!("Failed to join {cli_name} blocking task: {e}"))?
         }
         Err(_) => {
             // Kill through the shared handle — the Child is still in the mutex
@@ -3219,15 +3445,13 @@ async fn execute_ai_cli(
                 Ok(join_result) => {
                     if let Err(e) = join_result {
                         return Err(format!(
-                            "Failed to join {} blocking task after timeout: {}",
-                            cli_name, e
+                            "Failed to join {cli_name} blocking task after timeout: {e}"
                         ));
                     }
                 }
                 Err(_) => {
                     return Err(format!(
-                        "{} CLI timed out and failed to exit after kill signal",
-                        cli_name
+                        "{cli_name} CLI timed out and failed to exit after kill signal"
                     ));
                 }
             }
@@ -3235,7 +3459,7 @@ async fn execute_ai_cli(
             AiExecutionResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("{} CLI timed out after 5 minutes", cli_name)),
+                error: Some(format!("{cli_name} CLI timed out after 5 minutes")),
             }
         }
     };
@@ -3251,7 +3475,10 @@ async fn ai_execute_claude(
 ) -> Result<AiExecutionResult, String> {
     let folder = {
         let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
     };
     let path = PathBuf::from(&file_path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -3319,7 +3546,10 @@ async fn ai_execute_opencode(
 ) -> Result<AiExecutionResult, String> {
     let folder = {
         let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
     };
     let path = PathBuf::from(&file_path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -3340,8 +3570,7 @@ async fn ai_execute_opencode(
         "Edit the attached markdown file in place.\n\
          Do not create, delete, rename, or modify any other files.\n\
          User instructions:\n\
-         {}",
-        prompt
+         {prompt}"
     );
 
     execute_ai_cli(
@@ -3378,7 +3607,7 @@ async fn ai_check_lmstudio_cli() -> Result<bool, String> {
         }
     })
     .await
-    .map_err(|e| format!("Failed to check LM Studio CLI: {}", e))?
+    .map_err(|e| format!("Failed to check LM Studio CLI: {e}"))?
 }
 
 #[tauri::command]
@@ -3390,7 +3619,10 @@ async fn ai_execute_lmstudio(
 ) -> Result<AiExecutionResult, String> {
     let folder = {
         let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
     };
     let path = PathBuf::from(&file_path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -3409,7 +3641,7 @@ async fn ai_execute_lmstudio(
 
     let file_content = tokio::fs::read_to_string(&canonical)
         .await
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+        .map_err(|e| format!("Failed to read file: {e}"))?;
 
     let stdin_input = format!(
         "You are a markdown editor. Edit the markdown content below according to the user's instructions.\n\
@@ -3456,7 +3688,7 @@ async fn ai_execute_lmstudio(
         }
         tokio::fs::write(&canonical, edited_content.as_bytes())
             .await
-            .map_err(|e| format!("Failed to write edited file: {}", e))?;
+            .map_err(|e| format!("Failed to write edited file: {e}"))?;
 
         Ok(AiExecutionResult {
             success: true,
@@ -3479,7 +3711,7 @@ async fn ai_check_antigravity_cli() -> Result<bool, String> {
         }
     })
     .await
-    .map_err(|e| format!("Failed to check Antigravity CLI: {}", e))?
+    .map_err(|e| format!("Failed to check Antigravity CLI: {e}"))?
 }
 
 #[tauri::command]
@@ -3491,7 +3723,10 @@ async fn ai_execute_antigravity(
 ) -> Result<AiExecutionResult, String> {
     let folder = {
         let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
     };
     let path = PathBuf::from(&file_path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -3554,7 +3789,10 @@ async fn ai_execute_ollama(
 ) -> Result<AiExecutionResult, String> {
     let folder = {
         let app_config = state.app_config.read().expect("app_config read lock");
-        app_config.notes_folder.clone().ok_or("Notes folder not set")?
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
     };
     let path = PathBuf::from(&file_path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -3574,7 +3812,7 @@ async fn ai_execute_ollama(
     // Read the current file content
     let file_content = tokio::fs::read_to_string(&canonical)
         .await
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+        .map_err(|e| format!("Failed to read file: {e}"))?;
 
     let stdin_input = format!(
         "You are a markdown editor. Edit the markdown content below according to the user's instructions.\n\
@@ -3616,8 +3854,7 @@ async fn ai_execute_ollama(
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Model '{}' is not installed. Run: ollama pull {}",
-                    model_name, model_name
+                    "Model '{model_name}' is not installed. Run: ollama pull {model_name}"
                 )),
             });
         }
@@ -3647,8 +3884,7 @@ async fn ai_execute_ollama(
                     success: false,
                     output: String::new(),
                     error: Some(format!(
-                        "Model '{}' not found. Run `ollama pull {}` in your terminal to download it.",
-                        model_name, model_name
+                        "Model '{model_name}' not found. Run `ollama pull {model_name}` in your terminal to download it."
                     )),
                 });
             }
@@ -3656,7 +3892,10 @@ async fn ai_execute_ollama(
                 return Ok(AiExecutionResult {
                     success: false,
                     output: String::new(),
-                    error: Some("Authentication required. Run `ollama login` in your terminal to sign in.".to_string()),
+                    error: Some(
+                        "Authentication required. Run `ollama login` in your terminal to sign in."
+                            .to_string(),
+                    ),
                 });
             }
         }
@@ -3674,7 +3913,7 @@ async fn ai_execute_ollama(
         }
         tokio::fs::write(&canonical, edited_content.as_bytes())
             .await
-            .map_err(|e| format!("Failed to write edited file: {}", e))?;
+            .map_err(|e| format!("Failed to write edited file: {e}"))?;
 
         Ok(AiExecutionResult {
             success: true,
@@ -3839,7 +4078,7 @@ fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) {
         if is_markdown_extension(&path) && path.is_file() {
             if !try_select_in_notes_folder(app, &path) {
                 if let Err(error) = open_external_file_in_main(app, &path) {
-                    eprintln!("Failed to open markdown file {:?}: {}", path, error);
+                    eprintln!("Failed to open markdown file {path:?}: {error}");
                 }
             }
         } else if path.is_dir() {
@@ -3853,7 +4092,7 @@ fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) {
                     let _ = app.emit("set-notes-folder", normalized_path);
                 }
                 Err(e) => {
-                    eprintln!("Failed to initialize notes folder {:?}: {}", canonical, e);
+                    eprintln!("Failed to initialize notes folder {canonical:?}: {e}");
                 }
             }
         }
@@ -3921,7 +4160,9 @@ pub fn run() {
                     Ok(normalized) => {
                         // Path is structurally valid but not currently a directory
                         // (e.g., unmounted drive). Preserve the user's preference.
-                        eprintln!("Notes folder not found (may be temporarily unavailable): {:?}", normalized);
+                        eprintln!(
+                            "Notes folder not found (may be temporarily unavailable): {normalized:?}"
+                        );
                     }
                     Err(_) => {
                         app_config.notes_folder = None;
@@ -3965,7 +4206,14 @@ pub fn run() {
             app.manage(state);
 
             // Add notes folder to asset protocol scope so images can be served
-            if let Some(ref folder) = app.state::<AppState>().app_config.read().expect("app_config read lock").notes_folder.clone() {
+            if let Some(ref folder) = app
+                .state::<AppState>()
+                .app_config
+                .read()
+                .expect("app_config read lock")
+                .notes_folder
+                .clone()
+            {
                 let _ = app.asset_protocol_scope().allow_directory(folder, true);
             }
 
@@ -3991,10 +4239,12 @@ pub fn run() {
             if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
                 let app = window.app_handle();
                 for path in paths {
-                    if is_markdown_extension(path) && path.is_file()
-                        && !try_select_in_notes_folder(app, path) {
+                    if is_markdown_extension(path)
+                        && path.is_file()
+                        && !try_select_in_notes_folder(app, path)
+                    {
                         if let Err(error) = open_external_file_in_main(app, path) {
-                            eprintln!("Failed to open dropped markdown file {:?}: {}", path, error);
+                            eprintln!("Failed to open dropped markdown file {path:?}: {error}");
                         }
                     }
                 }
@@ -4006,6 +4256,7 @@ pub fn run() {
             list_notes,
             read_note,
             save_note,
+            retain_note_recovery_draft,
             delete_note,
             create_note,
             list_folders,
@@ -4054,6 +4305,7 @@ pub fn run() {
             ai_execute_antigravity,
             read_file_direct,
             save_file_direct,
+            retain_file_recovery_draft,
             import_file_to_folder,
             open_file_preview,
             mark_main_ui_ready,
@@ -4114,8 +4366,7 @@ mod windows_title_bar {
 
         // Windows COLORREF is little-endian 0x00BBGGRR
         let (r, g, b) = rgb;
-        let caption_color: u32 =
-            ((b as u32) << 16) | ((g as u32) << 8) | (r as u32);
+        let caption_color: u32 = ((b as u32) << 16) | ((g as u32) << 8) | (r as u32);
 
         unsafe {
             let set_attr = |attr: u32, value: *const std::ffi::c_void, size: u32| {
@@ -4143,13 +4394,7 @@ mod windows_title_bar {
 }
 
 #[tauri::command]
-fn set_title_bar_theme(
-    app: AppHandle,
-    is_dark: bool,
-    r: u8,
-    g: u8,
-    b: u8,
-) -> Result<(), String> {
+fn set_title_bar_theme(app: AppHandle, is_dark: bool, r: u8, g: u8, b: u8) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         for (label, window) in app.webview_windows() {
