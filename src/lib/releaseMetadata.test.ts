@@ -36,7 +36,7 @@ test("v1.0.5 metadata, test runner, and development endpoint are internally cons
   assert.equal(tauriConfig.version, "1.0.5");
   assert.match(cargoToml, /^version = "1\.0\.5"$/m);
   assert.match(cargoToml, /^license = "MIT"$/m);
-  assert.match(cargoLock, /name = "markdown-editor"\nversion = "1\.0\.5"/);
+  assert.match(cargoLock, /name = "markdown-editor"\r?\nversion = "1\.0\.5"/);
   assert.equal(tauriConfig.build.devUrl, "http://localhost:3000");
   assert.equal(
     packageJson.scripts.test,
