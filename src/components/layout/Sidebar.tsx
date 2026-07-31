@@ -12,6 +12,7 @@ import {
 } from "@dnd-kit/core";
 import { useNotes } from "../../context/NotesContext";
 import { NoteList } from "../notes/NoteList";
+import { RecentExternalFiles } from "../notes/RecentExternalFiles";
 import { Footer } from "./Footer";
 import { IconButton, Input } from "../ui";
 import {
@@ -470,6 +471,8 @@ export function Sidebar({ onOpenSettings, onCreateNote }: SidebarProps) {
             </div>
           </div>
         )}
+
+        {!searchOpen && <RecentExternalFiles />}
 
         {/* Note list */}
         <NoteList

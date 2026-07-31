@@ -1,17 +1,15 @@
 import { useState, useEffect } from "react";
-import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { Button } from "../ui";
 import { GithubIcon } from "../icons";
+import { getAppVersionLabel } from "../../lib/appVersion";
 
 export function AboutSettingsSection() {
-  const [appVersion, setAppVersion] = useState<string>("");
+  const [appVersion, setAppVersion] = useState("Version unavailable");
 
   useEffect(() => {
-    getVersion()
-      .then(setAppVersion)
-      .catch(() => {});
+    void getAppVersionLabel().then(setAppVersion);
   }, []);
 
   const handleOpenUrl = async (url: string) => {
@@ -29,7 +27,7 @@ export function AboutSettingsSection() {
       <section className="pb-2">
         <h2 className="text-xl font-medium mb-0.5">Version</h2>
         <p className="text-sm text-text-muted mb-4">
-          You are currently using Markdown Editor v{appVersion || "..."}
+          You are currently using Markdown Editor {appVersion}
         </p>
         <p className="text-sm text-text-muted">
           Automatic updates are disabled for this independent edition. Install

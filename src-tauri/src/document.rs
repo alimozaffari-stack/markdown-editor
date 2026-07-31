@@ -588,6 +588,10 @@ fn replace_recovery_copy(temporary: &Path, target: &Path) -> io::Result<()> {
         if let Some(permissions) = original_permissions.as_ref() {
             if permissions.readonly() {
                 let mut writable = permissions.clone();
+                #[allow(
+                    clippy::permissions_set_readonly_false,
+                    reason = "Windows-only recovery path clears FILE_ATTRIBUTE_READONLY before replacing the target."
+                )]
                 writable.set_readonly(false);
                 fs::set_permissions(target, writable)?;
             }

@@ -1,4 +1,4 @@
-import { useCallback, memo } from "react";
+import { useCallback, useEffect, useState, memo } from "react";
 import { toast } from "sonner";
 import { useGit } from "../../context/GitContext";
 import { Button, IconButton, Tooltip } from "../ui";
@@ -12,6 +12,7 @@ import {
 } from "../icons";
 import { cn } from "../../lib/utils";
 import { mod, isMac } from "../../lib/platform";
+import { getAppVersionLabel } from "../../lib/appVersion";
 
 interface FooterProps {
   onOpenSettings?: () => void;
@@ -31,6 +32,11 @@ export const Footer = memo(function Footer({ onOpenSettings }: FooterProps) {
     lastError,
     clearError,
   } = useGit();
+  const [appVersion, setAppVersion] = useState("Version…");
+
+  useEffect(() => {
+    void getAppVersionLabel().then(setAppVersion);
+  }, []);
 
   const handleCommit = useCallback(async () => {
     if (isCommitting) return;
@@ -159,7 +165,10 @@ export const Footer = memo(function Footer({ onOpenSettings }: FooterProps) {
   // When there's no git content, show a floating settings button
   if (!hasGitFooterContent) {
     return (
-      <div className="absolute bottom-3 right-3">
+      <div className="absolute bottom-3 left-4 right-3 flex items-center justify-between gap-2">
+        <span className="text-2xs text-text-muted" title="Markdown Editor version">
+          {appVersion}
+        </span>
         <IconButton
           onClick={onOpenSettings}
           title={`Settings (${mod}${isMac ? "" : "+"}, to toggle)`}
@@ -175,7 +184,12 @@ export const Footer = memo(function Footer({ onOpenSettings }: FooterProps) {
     <div className="shrink-0 border-t border-border">
       {/* Footer bar with git status and action buttons */}
       <div className="pl-4 pr-3 pt-2 pb-2.5 flex items-center justify-between">
-        {renderGitStatus()}
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="text-2xs text-text-muted shrink-0" title="Markdown Editor version">
+            {appVersion}
+          </span>
+          {renderGitStatus()}
+        </div>
         <div className="flex items-center gap-px">
           {/* Sync button — pulls then pushes, always visible when upstream is configured */}
           {showSyncButton && (
