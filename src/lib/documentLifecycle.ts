@@ -67,6 +67,18 @@ export function toSourceEditorText(content: string): string {
   return content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
+export function isInternalWorkspaceFile(
+  filePath: string | null | undefined,
+  notesFolder: string | null | undefined,
+): boolean {
+  if (!filePath || !notesFolder) return false;
+  const normalize = (p: string) => p.replace(/\\/g, "/").toLowerCase();
+  const fileNorm = normalize(filePath);
+  const baseNorm = normalize(notesFolder);
+  const basePrefix = baseNorm.endsWith("/") ? baseNorm : `${baseNorm}/`;
+  return fileNorm === baseNorm || fileNorm.startsWith(basePrefix);
+}
+
 function sourceOffsetAtEditorOffset(
   source: string,
   requestedEditorOffset: number,
@@ -142,10 +154,13 @@ function changedEditorRange(
   };
 }
 
+export type DocumentEditOutcome = "ignored" | "dirty" | "clean";
+
 export class DocumentSession {
   private snapshot: DocumentSnapshot;
   private sourceContent: string;
   private visualContent: string;
+  private visualBaseline: string;
   private dirty = false;
   private mode: DocumentMode = "visual";
   private authority: DocumentAuthority = "source";
@@ -156,6 +171,7 @@ export class DocumentSession {
     this.snapshot = { ...snapshot };
     this.sourceContent = snapshot.content;
     this.visualContent = snapshot.content;
+    this.visualBaseline = snapshot.content;
   }
 
   get currentSnapshot(): Readonly<DocumentSnapshot> {
@@ -197,9 +213,16 @@ export class DocumentSession {
       this.snapshot = { ...snapshot };
       this.sourceContent = snapshot.content;
       this.visualContent = snapshot.content;
+      this.visualBaseline = snapshot.content;
       this.authority = "source";
       this.dirty = false;
     });
+  }
+
+  establishInitialVisualBaseline(serialisedMarkdown: string): void {
+    this.visualBaseline = serialisedMarkdown;
+    this.visualContent = serialisedMarkdown;
+    this.dirty = false;
   }
 
   rebaseSnapshot(snapshot: DocumentSnapshot): void {
@@ -207,6 +230,7 @@ export class DocumentSession {
     if (!this.dirty) {
       this.sourceContent = snapshot.content;
       this.visualContent = snapshot.content;
+      this.visualBaseline = snapshot.content;
       this.authority = "source";
       return;
     }
@@ -233,17 +257,28 @@ export class DocumentSession {
     }
   }
 
-  recordVisualEdit(content: string): boolean {
+  recordVisualEdit(content: string): DocumentEditOutcome {
     if (this.programmaticDepth > 0) {
       this.visualContent = content;
-      return false;
+      return "ignored";
     }
-    if (this.preserveSourceFormatting) return false;
+    if (this.preserveSourceFormatting) return "ignored";
 
     this.visualContent = content;
     this.authority = "visual";
-    this.dirty = content !== this.snapshot.content;
-    return true;
+
+    if (!this.visualBaseline) {
+      this.visualBaseline = content;
+      this.dirty = false;
+      return "clean";
+    }
+
+    const norm = (s: string) => s.replace(/\r\n/g, "\n").trimEnd();
+    const isClean =
+      norm(content) === norm(this.visualBaseline) ||
+      norm(content) === norm(this.snapshot.content);
+    this.dirty = !isClean;
+    return this.dirty ? "dirty" : "clean";
   }
 
   recordSourceEdit(content: string): boolean {

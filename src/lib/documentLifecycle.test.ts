@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   canAcceptDocumentInput,
   DocumentSession,
+  isInternalWorkspaceFile,
   toSourceEditorText,
   type DocumentProgrammaticEvent,
   type DocumentSnapshot,
@@ -180,7 +181,7 @@ test("preservation mode keeps source authority and blocks visual serialisation",
 
   const accepted = session.recordVisualEdit("# Original\n\nNormalised source\n");
 
-  assert.equal(accepted, false);
+  assert.equal(accepted, "ignored");
   assert.equal(session.takeSaveRequest("autosave"), null);
 
   const edited = `${original}\r\nTrailing spaces stay  \r\n`;
@@ -382,4 +383,299 @@ test("the non-Gemini no-operation corpus never reaches the write boundary", () =
       fixture.name,
     );
   }
+});
+
+test("opening/hydrating a file whose visual serialisation differs from disk text produces no save request", () => {
+  const diskText = "# Heading  \n\n- Item 1\n- Item 2\n";
+  const session = new DocumentSession(snapshot(diskText));
+
+  // Editor initialisation sets content programmatically and establishes baseline
+  const serialisedVisual = "# Heading\n\n* Item 1\n* Item 2\n";
+  session.runProgrammatic(() => {
+    session.recordVisualEdit(serialisedVisual);
+  });
+  session.establishInitialVisualBaseline(serialisedVisual);
+
+  // Subsequent onUpdate callback with reserialised content
+  const outcome = session.recordVisualEdit(serialisedVisual);
+
+  assert.equal(outcome, "clean");
+  assert.equal(session.isDirty, false);
+  assert.equal(session.takeSaveRequest("autosave"), null);
+});
+
+test("a genuine visual edit becomes dirty and creates a save request", () => {
+  const diskText = "# Heading\n";
+  const session = new DocumentSession(snapshot(diskText));
+  session.establishInitialVisualBaseline("# Heading\n");
+
+  const outcome = session.recordVisualEdit("# Heading\n\nUser edit\n");
+
+  assert.equal(outcome, "dirty");
+  assert.equal(session.isDirty, true);
+  assert.equal(
+    session.takeSaveRequest("autosave")?.content,
+    "# Heading\n\nUser edit\n",
+  );
+});
+
+test("reverting to visual baseline clears dirty state and yields no save request", () => {
+  const diskText = "# Heading\n";
+  const session = new DocumentSession(snapshot(diskText));
+  const baseline = "# Heading\n";
+  session.establishInitialVisualBaseline(baseline);
+
+  const editOutcome = session.recordVisualEdit("# Heading\n\nTemp edit\n");
+  assert.equal(editOutcome, "dirty");
+
+  const revertOutcome = session.recordVisualEdit(baseline);
+  assert.equal(revertOutcome, "clean");
+  assert.equal(session.isDirty, false);
+  assert.equal(session.takeSaveRequest("autosave"), null);
+});
+
+test("source edit -> visual mode and visual edit -> source mode both remain dirty and saveable", () => {
+  const session1 = new DocumentSession(snapshot("# Base\n"));
+  session1.recordSourceEdit("# Base\n\nSource edit\n");
+  session1.setMode("visual");
+  assert.equal(session1.isDirty, true);
+  assert.ok(session1.takeSaveRequest("autosave"));
+
+  const session2 = new DocumentSession(snapshot("# Base\n"));
+  session2.establishInitialVisualBaseline("# Base\n");
+  session2.recordVisualEdit("# Base\n\nVisual edit\n");
+});
+
+test("a compatibility-metadata save rebases a pending body edit", () => {
+  const session = new DocumentSession(snapshot());
+  session.recordSourceEdit("# Pending body edit\r\n");
+
+  session.rebaseSnapshot({
+    ...snapshot(),
+    sourceContent:
+      "# Original\r\n\r\nExact source\r\n\r\n[^1]: Added metadata\r\n",
+    hash: "metadata-save-hash",
+    revision: 8,
+  });
+
+  assert.equal(session.isDirty, true);
+  assert.deepEqual(session.takeSaveRequest("autosave"), {
+    content: "# Pending body edit\r\n",
+    contentBaseline: "# Original\r\n\r\nExact source\r\n",
+    sourceBaseline:
+      "# Original\r\n\r\nExact source\r\n\r\n[^1]: Added metadata\r\n",
+    baselineHash: "metadata-save-hash",
+    revision: 8,
+    encoding: "utf-8",
+    bom: "none",
+    lineEnding: "crlf",
+    authority: "source",
+    reason: "autosave",
+  });
+});
+
+test("the non-Gemini no-operation corpus never reaches the write boundary", () => {
+  const syntax = [
+    "# Unicode – α and العربية",
+    "",
+    "1. Ordered",
+    "   - Nested",
+    "",
+    "| A | B |",
+    "| --- | --- |",
+    "| 1 | 2 |",
+    "",
+    "A [link](https://example.com) and a footnote.[^1]",
+    "",
+    "[^1]: Exact note.",
+    "",
+    "> Block quote",
+    "",
+    "```typescript",
+    "const exact = true;",
+    "```",
+    "",
+    "```mermaid",
+    "graph TD",
+    "  A --> B",
+    "```",
+    "",
+    "$$",
+    "E = mc^2",
+    "$$",
+    "",
+    "<!-- compatibility comment -->",
+    "",
+    "[[Linked Note]]",
+    "",
+    "",
+    "Intentional blank line above.",
+  ];
+  const corpus = [
+    {
+      name: "UTF-8 LF",
+      content: syntax.join("\n"),
+      bytes: Buffer.from(syntax.join("\n"), "utf8"),
+      bom: "none" as const,
+      lineEnding: "lf" as const,
+    },
+    {
+      name: "UTF-8 CRLF",
+      content: syntax.join("\r\n"),
+      bytes: Buffer.from(syntax.join("\r\n"), "utf8"),
+      bom: "none" as const,
+      lineEnding: "crlf" as const,
+    },
+    {
+      name: "UTF-8 BOM",
+      content: syntax.join("\n"),
+      bytes: Buffer.concat([
+        Buffer.from([0xef, 0xbb, 0xbf]),
+        Buffer.from(syntax.join("\n"), "utf8"),
+      ]),
+      bom: "utf-8" as const,
+      lineEnding: "lf" as const,
+    },
+  ];
+
+  for (const fixture of corpus) {
+    const initialHash = createHash("sha256")
+      .update(fixture.bytes)
+      .digest("hex");
+    const session = new DocumentSession({
+      content: fixture.content,
+      hash: initialHash,
+      revision: 1,
+      encoding: "utf-8",
+      bom: fixture.bom,
+      lineEnding: fixture.lineEnding,
+    });
+    let writes = 0;
+    const tryPersist = () => {
+      if (session.takeSaveRequest("autosave")) writes += 1;
+    };
+
+    session.noteProgrammaticEvent("focus");
+    session.noteProgrammaticEvent("selection");
+    session.noteProgrammaticEvent("workspace-switch");
+    session.runProgrammatic(() => {
+      session.setMode("source");
+      session.recordSourceEdit(fixture.content);
+      session.setMode("visual");
+      session.recordVisualEdit(fixture.content);
+      session.setMode("source");
+    });
+    session.noteProgrammaticEvent("watcher-refresh");
+    session.noteProgrammaticEvent("timer-expiry");
+    tryPersist();
+
+    assert.equal(writes, 0, fixture.name);
+    assert.equal(session.isDirty, false, fixture.name);
+    assert.equal(session.currentSnapshot.hash, initialHash, fixture.name);
+    assert.equal(
+      createHash("sha256").update(fixture.bytes).digest("hex"),
+      initialHash,
+      fixture.name,
+    );
+  }
+});
+
+test("opening/hydrating a file whose visual serialisation differs from disk text produces no save request", () => {
+  const diskText = "# Heading  \n\n- Item 1\n- Item 2\n";
+  const session = new DocumentSession(snapshot(diskText));
+
+  // Editor initialisation sets content programmatically and establishes baseline
+  const serialisedVisual = "# Heading\n\n* Item 1\n* Item 2\n";
+  session.runProgrammatic(() => {
+    session.recordVisualEdit(serialisedVisual);
+  });
+  session.establishInitialVisualBaseline(serialisedVisual);
+
+  // Subsequent onUpdate callback with reserialised content
+  const outcome = session.recordVisualEdit(serialisedVisual);
+
+  assert.equal(outcome, "clean");
+  assert.equal(session.isDirty, false);
+  assert.equal(session.takeSaveRequest("autosave"), null);
+});
+
+test("a genuine visual edit becomes dirty and creates a save request", () => {
+  const diskText = "# Heading\n";
+  const session = new DocumentSession(snapshot(diskText));
+  session.establishInitialVisualBaseline("# Heading\n");
+
+  const outcome = session.recordVisualEdit("# Heading\n\nUser edit\n");
+
+  assert.equal(outcome, "dirty");
+  assert.equal(session.isDirty, true);
+  assert.equal(
+    session.takeSaveRequest("autosave")?.content,
+    "# Heading\n\nUser edit\n",
+  );
+});
+
+test("reverting to visual baseline clears dirty state and yields no save request", () => {
+  const diskText = "# Heading\n";
+  const session = new DocumentSession(snapshot(diskText));
+  const baseline = "# Heading\n";
+  session.establishInitialVisualBaseline(baseline);
+
+  const editOutcome = session.recordVisualEdit("# Heading\n\nTemp edit\n");
+  assert.equal(editOutcome, "dirty");
+
+  const revertOutcome = session.recordVisualEdit(baseline);
+  assert.equal(revertOutcome, "clean");
+  assert.equal(session.isDirty, false);
+  assert.equal(session.takeSaveRequest("autosave"), null);
+});
+
+test("source edit -> visual mode and visual edit -> source mode both remain dirty and saveable", () => {
+  const session1 = new DocumentSession(snapshot("# Base\n"));
+  session1.recordSourceEdit("# Base\n\nSource edit\n");
+  session1.setMode("visual");
+  assert.equal(session1.isDirty, true);
+  assert.ok(session1.takeSaveRequest("autosave"));
+
+  const session2 = new DocumentSession(snapshot("# Base\n"));
+  session2.establishInitialVisualBaseline("# Base\n");
+  session2.recordVisualEdit("# Base\n\nVisual edit\n");
+  session2.setMode("source");
+  assert.equal(session2.isDirty, true);
+  assert.ok(session2.takeSaveRequest("autosave"));
+});
+
+test("generic programmatic updates never reset a dirty document's baseline", () => {
+  const session = new DocumentSession(snapshot("# Base\n"));
+  session.establishInitialVisualBaseline("# Base\n");
+  session.recordVisualEdit("# Base\n\nUser edit\n");
+  assert.equal(session.isDirty, true);
+
+  session.runProgrammatic(() => {
+    session.noteProgrammaticEvent("mode-switch");
+  });
+
+  assert.equal(session.isDirty, true);
+  assert.ok(session.takeSaveRequest("autosave"));
+});
+
+test("isInternalWorkspaceFile correctly identifies managed notes vs external standalone files", () => {
+  const base = "D:\\Apps\\markdown-editor\\notes";
+  assert.equal(
+    isInternalWorkspaceFile("D:\\Apps\\markdown-editor\\notes\\my_note.md", base),
+    true,
+  );
+  assert.equal(
+    isInternalWorkspaceFile("D:\\Apps\\markdown-editor\\notes\\subfolder\\doc.md", base),
+    true,
+  );
+  assert.equal(
+    isInternalWorkspaceFile("D:\\Downloads\\Test file.md", base),
+    false,
+  );
+  assert.equal(
+    isInternalWorkspaceFile("G:\\My Drive\\Doc.md", base),
+    false,
+  );
+  assert.equal(isInternalWorkspaceFile(null, base), false);
+  assert.equal(isInternalWorkspaceFile("C:\\file.md", null), false);
 });

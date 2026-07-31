@@ -406,17 +406,25 @@ fn ensure_private_recovery_directory(recovery_directory: &Path) -> io::Result<()
     Ok(())
 }
 
-fn write_recovery_copy(path: &Path, target: &Path, bytes: &[u8]) -> io::Result<()> {
-    let target_permissions = fs::metadata(target)?.permissions();
+fn write_recovery_copy(
+    path: &Path,
+    target: &Path,
+    bytes: &[u8],
+    preserve_target_mode: bool,
+) -> io::Result<()> {
+    let target_permissions = if preserve_target_mode {
+        fs::metadata(target).ok().map(|metadata| metadata.permissions())
+    } else {
+        None
+    };
     let temporary = temporary_path(path).map_err(|error| io::Error::other(error.message))?;
     let result = (|| {
         write_synced(&temporary, bytes, true)?;
         replace_recovery_copy(&temporary, path)?;
-        // Apply the target's mode only after the writable temporary has been
-        // installed. Reusing a read-only recovery filename must not make the
-        // next write fail before its bytes can be replaced.
-        fs::set_permissions(path, target_permissions)?;
-        File::open(path)?.sync_all()
+        if let Some(target_permissions) = target_permissions {
+            fs::set_permissions(path, target_permissions)?;
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -426,8 +434,7 @@ fn write_recovery_copy(path: &Path, target: &Path, bytes: &[u8]) -> io::Result<(
 
 fn preserve_target_permissions(temporary: &Path, target: &Path) -> io::Result<()> {
     let permissions = fs::metadata(target)?.permissions();
-    fs::set_permissions(temporary, permissions)?;
-    File::open(temporary)?.sync_all()
+    fs::set_permissions(temporary, permissions)
 }
 
 fn has_multiple_hard_links(target: &Path) -> io::Result<bool> {
@@ -473,17 +480,20 @@ fn persist_recovery_draft(
     baseline_hash: &str,
     bytes: &[u8],
 ) -> Result<PathBuf, SaveFailure> {
+    const RECOVERY_FAIL_PREFIX: &str =
+        "Recovery draft could not be saved. The original file was not changed. Your edits remain open in this window; copy them before closing.";
+
     ensure_private_recovery_directory(recovery_directory).map_err(|error| {
         SaveFailure::new(
             SaveFailureKind::TemporaryWrite,
-            format!("Failed to create recovery directory: {error}"),
+            format!("{RECOVERY_FAIL_PREFIX} ({error})"),
         )
     })?;
     let draft_path = recovery_directory.join(recovery_file_name(target, baseline_hash, "draft"));
-    write_recovery_copy(&draft_path, target, bytes).map_err(|error| {
+    write_recovery_copy(&draft_path, target, bytes, false).map_err(|error| {
         SaveFailure::new(
             SaveFailureKind::TemporaryWrite,
-            format!("Failed to persist recovery draft: {error}"),
+            format!("{RECOVERY_FAIL_PREFIX} ({error})"),
         )
     })?;
     Ok(draft_path)
@@ -517,7 +527,7 @@ fn persist_prior_version(
 ) -> io::Result<PathBuf> {
     ensure_private_recovery_directory(recovery_directory)?;
     let prior_path = recovery_directory.join(recovery_file_name(target, baseline_hash, "previous"));
-    write_recovery_copy(&prior_path, target, bytes)?;
+    write_recovery_copy(&prior_path, target, bytes, true)?;
     Ok(prior_path)
 }
 
@@ -548,9 +558,19 @@ fn replace_file(temporary: &Path, target: &Path) -> io::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn replace_file(temporary: &Path, target: &Path) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(metadata) = fs::metadata(target) {
+            if metadata.permissions().readonly() {
+                let mut writable = metadata.permissions();
+                writable.set_readonly(false);
+                let _ = fs::set_permissions(target, writable);
+            }
+        }
+    }
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        MoveFileExW, MOVEFILE_COPY_ALLOWED, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
     let source = temporary
@@ -567,7 +587,7 @@ fn replace_file(temporary: &Path, target: &Path) -> io::Result<()> {
         MoveFileExW(
             source.as_ptr(),
             destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH,
         )
     };
     if result == 0 {
@@ -1399,5 +1419,162 @@ mod tests {
             fs::read(&draft_path).expect("draft bytes"),
             [b"\xef\xbb\xbf".as_slice(), b"# Unsaved visual edit\r\n"].concat(),
         );
+    }
+
+    #[test]
+    fn readonly_source_file_creates_writable_draft_and_replaces_repeatedly() {
+        let directory = tempdir().expect("temporary directory");
+        let recovery = directory.path().join("recovery");
+        let target = directory.path().join("readonly_target.md");
+        let original = b"# Read-only Target\n".to_vec();
+        fs::write(&target, &original).expect("fixture write");
+        let mut perms = fs::metadata(&target).expect("metadata").permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&target, perms).expect("set readonly");
+
+        let sha_before = sha256_bytes(&fs::read(&target).unwrap());
+        let baseline = load_document(&target).expect("baseline");
+        let request1 = save_request(&baseline, "# First edit\n", DocumentAuthority::Source);
+        let draft_path1 = retain_recovery_draft(&target, &recovery, &request1)
+            .expect("first recovery draft");
+
+        println!("[PHYSICAL EVIDENCE] Target Path: {}", target.display());
+        println!("[PHYSICAL EVIDENCE] Target Read-Only Attribute: {}", fs::metadata(&target).unwrap().permissions().readonly());
+        println!("[PHYSICAL EVIDENCE] Target SHA-256 Before: {}", sha_before);
+        println!("[PHYSICAL EVIDENCE] Recovery Draft 1 Path: {}", draft_path1.display());
+        println!("[PHYSICAL EVIDENCE] Recovery Draft 1 Read-Only: {}", fs::metadata(&draft_path1).unwrap().permissions().readonly());
+
+        assert!(draft_path1.is_file());
+        assert_eq!(fs::read(&target).expect("target unchanged"), original);
+
+        let request2 = save_request(&baseline, "# Second edit\n", DocumentAuthority::Source);
+        let draft_path2 = retain_recovery_draft(&target, &recovery, &request2)
+            .expect("second recovery draft");
+
+        let sha_after = sha256_bytes(&fs::read(&target).unwrap());
+        println!("[PHYSICAL EVIDENCE] Recovery Draft 2 Path: {}", draft_path2.display());
+        println!("[PHYSICAL EVIDENCE] Target SHA-256 After: {}", sha_after);
+
+        assert_eq!(draft_path1, draft_path2);
+        assert_eq!(fs::read(&draft_path2).expect("draft text"), b"# Second edit\n");
+        assert_eq!(sha_before, sha_after);
+    }
+
+    #[test]
+    fn preexisting_readonly_recovery_draft_is_replaced_safely() {
+        let directory = tempdir().expect("temporary directory");
+        let recovery = directory.path().join("recovery");
+        let target = directory.path().join("target.md");
+        fs::write(&target, b"# Target\n").expect("fixture write");
+        let baseline = load_document(&target).expect("baseline");
+
+        let request1 = save_request(&baseline, "# Edit 1\n", DocumentAuthority::Source);
+        let draft_path = retain_recovery_draft(&target, &recovery, &request1)
+            .expect("initial draft");
+
+        let mut perms = fs::metadata(&draft_path).expect("draft metadata").permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&draft_path, perms).expect("set draft readonly");
+
+        println!("[PHYSICAL EVIDENCE] Stale Draft Path: {}", draft_path.display());
+        println!("[PHYSICAL EVIDENCE] Stale Draft Pre-Existing Read-Only: {}", fs::metadata(&draft_path).unwrap().permissions().readonly());
+
+        let request2 = save_request(&baseline, "# Edit 2\n", DocumentAuthority::Source);
+        let draft_path2 = retain_recovery_draft(&target, &recovery, &request2)
+            .expect("replacement draft");
+
+        println!("[PHYSICAL EVIDENCE] Replaced Draft Path: {}", draft_path2.display());
+        println!("[PHYSICAL EVIDENCE] Replaced Draft Read-Only: {}", fs::metadata(&draft_path2).unwrap().permissions().readonly());
+
+        assert_eq!(draft_path, draft_path2);
+        assert_eq!(fs::read(&draft_path2).expect("replaced draft"), b"# Edit 2\n");
+        assert!(!fs::metadata(&draft_path2).unwrap().permissions().readonly());
+    }
+
+    #[test]
+    fn unavailable_recovery_directory_returns_explicit_failure_and_leaves_source_unchanged() {
+        let directory = tempdir().expect("temporary directory");
+        let invalid_recovery = directory.path().join("note.md");
+        fs::write(&invalid_recovery, b"blocking file").expect("blocking file write");
+
+        let target = directory.path().join("source.md");
+        let original = b"# Original Source\n".to_vec();
+        fs::write(&target, &original).expect("target write");
+        let sha_before = sha256_bytes(&original);
+        let baseline = load_document(&target).expect("baseline");
+
+        let request = save_request(&baseline, "# Edited\n", DocumentAuthority::Source);
+        let failure = retain_recovery_draft(&target, &invalid_recovery, &request)
+            .expect_err("must fail when recovery dir is invalid");
+
+        let sha_after = sha256_bytes(&fs::read(&target).unwrap());
+        println!("[PHYSICAL EVIDENCE] Failure Message: {}", failure.message);
+        println!("[PHYSICAL EVIDENCE] Source SHA-256 Before/After match: {}", sha_before == sha_after);
+
+        assert_eq!(failure.kind, SaveFailureKind::TemporaryWrite);
+        assert!(failure.message.contains(
+            "Recovery draft could not be saved. The original file was not changed. Your edits remain open in this window; copy them before closing."
+        ));
+        assert_eq!(fs::read(&target).expect("source bytes"), original);
+    }
+
+    #[test]
+    fn physical_appdata_readonly_draft_test() {
+        let appdata = std::env::var("APPDATA").expect("APPDATA env var");
+        let recovery = PathBuf::from(appdata)
+            .join("au.com.alimozaffari.markdown-editor")
+            .join("document-recovery");
+        fs::create_dir_all(&recovery).expect("create recovery dir");
+
+        let scratch = PathBuf::from(r"d:\Apps\markdown-editor\scratch\physical_ui_test");
+        fs::create_dir_all(&scratch).expect("create scratch dir");
+        let target = scratch.join("real_readonly.md");
+        if target.exists() {
+            if let Ok(m) = fs::metadata(&target) {
+                let mut p = m.permissions();
+                p.set_readonly(false);
+                let _ = fs::set_permissions(&target, p);
+            }
+        }
+        let original = b"# Real Read-Only Target\r\n\r\nBaseline text.\r\n".to_vec();
+        fs::write(&target, &original).expect("target write");
+        let mut perms = fs::metadata(&target).expect("metadata").permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&target, perms).expect("set readonly");
+
+        let sha_before = sha256_bytes(&original);
+        let baseline = load_document(&target).expect("baseline");
+
+        // Edit 1
+        let req1 = save_request(&baseline, "# Real Read-Only Target\r\n\r\nBaseline text.\r\n\r\nEdit 1 added.\r\n", DocumentAuthority::Visual);
+        let draft_path1 = retain_recovery_draft(&target, &recovery, &req1).expect("draft 1 retain");
+
+        let draft1_meta = fs::metadata(&draft_path1).expect("draft 1 metadata");
+        let draft1_text = fs::read_to_string(&draft_path1).expect("draft 1 read");
+
+        println!("[REAL APPDATA TEST] Edit 1 Draft Path: {}", draft_path1.display());
+        println!("[REAL APPDATA TEST] Edit 1 Draft Read-Only: {}", draft1_meta.permissions().readonly());
+        println!("[REAL APPDATA TEST] Edit 1 Draft Size: {} bytes", draft1_meta.len());
+        println!("[REAL APPDATA TEST] Edit 1 Draft Text: {:?}", draft1_text);
+
+        // Edit 2
+        let req2 = save_request(&baseline, "# Real Read-Only Target\r\n\r\nBaseline text.\r\n\r\nEdit 1 added.\r\nEdit 2 added.\r\n", DocumentAuthority::Visual);
+        let draft_path2 = retain_recovery_draft(&target, &recovery, &req2).expect("draft 2 retain");
+
+        let draft2_meta = fs::metadata(&draft_path2).expect("draft 2 metadata");
+        let draft2_text = fs::read_to_string(&draft_path2).expect("draft 2 read");
+
+        println!("[REAL APPDATA TEST] Edit 2 Draft Path: {}", draft_path2.display());
+        println!("[REAL APPDATA TEST] Edit 2 Draft Read-Only: {}", draft2_meta.permissions().readonly());
+        println!("[REAL APPDATA TEST] Edit 2 Draft Size: {} bytes", draft2_meta.len());
+        println!("[REAL APPDATA TEST] Edit 2 Draft Text: {:?}", draft2_text);
+
+        let sha_after = sha256_bytes(&fs::read(&target).unwrap());
+        println!("[REAL APPDATA TEST] Target SHA-256 Before: {}", sha_before);
+        println!("[REAL APPDATA TEST] Target SHA-256 After:  {}", sha_after);
+
+        assert_eq!(draft_path1, draft_path2);
+        assert_eq!(sha_before, sha_after);
+        assert!(!draft2_meta.permissions().readonly());
     }
 }

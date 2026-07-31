@@ -93,7 +93,7 @@ export function RecentExternalFiles() {
           </button>
         </div>
 
-        <div className="max-h-52 overflow-y-auto px-2 pb-2">
+        <div className="px-2 pb-2">
           {files.map((file) => (
             <div
               key={file.path}

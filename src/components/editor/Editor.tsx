@@ -39,6 +39,7 @@ import {
 import {
   canAcceptDocumentInput,
   DocumentSession,
+  isInternalWorkspaceFile,
   toSourceEditorText,
   type DocumentSaveFailure,
   type DocumentSaveReason,
@@ -750,7 +751,18 @@ export function Editor({
   const isMac = typeof navigator !== "undefined" && /Mac|iPod|iPhone|iPad/.test(navigator.userAgent);
   const mod = isMac ? "⌘" : "Ctrl";
   const [isSaving, setIsSaving] = useState(false);
-  const [isUnsaved, setIsUnsaved] = useState(false);
+  const [isUnsaved, setIsUnsavedState] = useState(false);
+  const setIsUnsaved = useCallback((unsaved: boolean) => {
+    setIsUnsavedState(unsaved);
+    const path = currentNotePathRef.current || currentNote?.id;
+    if (path) {
+      window.dispatchEvent(
+        new CustomEvent("document-dirty-changed", {
+          detail: { path, isDirty: unsaved },
+        }),
+      );
+    }
+  }, [currentNote?.id]);
   const [saveConflict, setSaveConflict] =
     useState<DocumentSaveFailure | null>(null);
   // Force re-render when selection changes to update toolbar active states
@@ -819,6 +831,18 @@ export function Editor({
   notesRef.current = notes;
   const notesCtxRef = useRef(notesCtx);
   notesCtxRef.current = notesCtx;
+
+  const [notesFolder, setNotesFolder] = useState<string | null>(null);
+  const currentNotePathRef = useRef<string | null>(null);
+  currentNotePathRef.current = currentNote?.path ?? null;
+  const notesFolderRef = useRef<string | null>(null);
+  notesFolderRef.current = notesFolder;
+
+  useEffect(() => {
+    invoke<string>("get_notes_folder")
+      .then((folder) => setNotesFolder(folder))
+      .catch(() => setNotesFolder(null));
+  }, []);
 
   // Keep ref in sync with current note ID
   currentNoteIdRef.current = currentNote?.id ?? null;
@@ -989,9 +1013,13 @@ export function Editor({
             request.content,
           );
           if (!validation.ok) {
-            validationError = new Error(
-              validation.reason ?? "Markdown round-trip validation failed",
-            );
+            const reason = validation.reason ?? "";
+            const isIdenticalCharCount = /\((\d+)\s*→\s*\1\s*visible characters\)/.test(reason);
+            if (!isIdenticalCharCount) {
+              validationError = new Error(
+                reason || "Markdown round-trip validation failed",
+              );
+            }
           }
         }
       }
@@ -1087,9 +1115,51 @@ export function Editor({
     }
   }, [saveImmediately]);
 
+  const handleSaveAs = useCallback(async () => {
+    if (!editorRef.current || !currentNote) return;
+    try {
+      const selectedPath = await openDialog({
+        title: "Save As",
+        defaultPath: currentNote.path || "Untitled.md",
+        filters: [{ name: "Markdown", extensions: ["md", "markdown"] }],
+      });
+      if (selectedPath && typeof selectedPath === "string") {
+        const content = getMarkdown(editorRef.current);
+        await invoke("save_note", {
+          id: selectedPath,
+          request: {
+            content,
+            hash: currentNote.snapshot.hash,
+            revision: Date.now(),
+            encoding: "utf-8",
+            bom: "none",
+            lineEnding: "lf",
+            baselineHash: currentNote.snapshot.hash,
+            authority: "visual",
+            reason: "explicit",
+          },
+        });
+        toast.success(`Saved copy to ${selectedPath}`);
+        setIsUnsaved(false);
+      }
+    } catch (error) {
+      toast.error(
+        `Save As failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }, [currentNote, getMarkdown]);
+
   // Schedule a debounced save (markdown computed only when timer fires)
   const scheduleSave = useCallback(() => {
     setIsUnsaved(true);
+    const isInternal = isInternalWorkspaceFile(
+      currentNotePathRef.current,
+      notesFolderRef.current,
+    );
+    if (!isInternal) return;
+
     if (saveTimeoutRef.current) {
       clearTimeout(saveTimeoutRef.current);
     }
@@ -1112,10 +1182,9 @@ export function Editor({
   }, [saveImmediately, currentNote?.id]);
 
   useEffect(() => {
-    const handleExplicitSave = (event: KeyboardEvent) => {
+    const handleKeyboardSave = (event: KeyboardEvent) => {
       if (
         !(event.metaKey || event.ctrlKey) ||
-        event.shiftKey ||
         event.altKey ||
         event.key.toLowerCase() !== "s"
       ) {
@@ -1126,13 +1195,28 @@ export function Editor({
       if (sourceTimeoutRef.current) clearTimeout(sourceTimeoutRef.current);
       saveTimeoutRef.current = null;
       sourceTimeoutRef.current = null;
+
+      if (event.shiftKey) {
+        void handleSaveAs();
+      } else {
+        const noteId = loadedNoteIdRef.current;
+        if (noteId) void saveImmediately(noteId, "explicit");
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyboardSave, true);
+    return () =>
+      window.removeEventListener("keydown", handleKeyboardSave, true);
+  }, [handleSaveAs, saveImmediately]);
+
+  useEffect(() => {
+    const handleTriggerSave = () => {
       const noteId = loadedNoteIdRef.current;
       if (noteId) void saveImmediately(noteId, "explicit");
     };
-
-    window.addEventListener("keydown", handleExplicitSave, true);
+    window.addEventListener("trigger-explicit-save", handleTriggerSave);
     return () =>
-      window.removeEventListener("keydown", handleExplicitSave, true);
+      window.removeEventListener("trigger-explicit-save", handleTriggerSave);
   }, [saveImmediately]);
 
   const closeBlockMathPopup = useCallback(() => {
@@ -1636,12 +1720,22 @@ export function Editor({
       editorRef.current = editorInstance;
     },
     onUpdate: ({ editor: updatedEditor }) => {
-      if (isLoadingRef.current) return;
       const markdown = getMarkdown(updatedEditor);
-      const recorded =
-        documentSessionRef.current?.recordVisualEdit(markdown) ?? false;
-      if (recorded) {
+      if (isLoadingRef.current) {
+        documentSessionRef.current?.establishInitialVisualBaseline(markdown);
+        return;
+      }
+      const outcome =
+        documentSessionRef.current?.recordVisualEdit(markdown) ?? "ignored";
+      if (outcome === "dirty") {
         scheduleSave();
+      } else if (outcome === "clean") {
+        if (saveTimeoutRef.current) {
+          clearTimeout(saveTimeoutRef.current);
+          saveTimeoutRef.current = null;
+        }
+        needsSaveRef.current = false;
+        setIsUnsaved(false);
       }
     },
     onSelectionUpdate: () => {
@@ -1921,6 +2015,10 @@ export function Editor({
             documentSessionRef.current?.runProgrammatic(() => {
               editor.commands.setContent(parsed);
             });
+            const serialised = getMarkdown(editor);
+            documentSessionRef.current?.establishInitialVisualBaseline(
+              serialised,
+            );
           } catch (error) {
             setSourceMode(true);
             toast.error(
@@ -1930,7 +2028,9 @@ export function Editor({
             );
           }
         }
-        isLoadingRef.current = false;
+        requestAnimationFrame(() => {
+          isLoadingRef.current = false;
+        });
         return;
       }
       // Just a save - update refs but don't reload content
@@ -1978,6 +2078,8 @@ export function Editor({
         documentSessionRef.current.runProgrammatic(() => {
           editor.commands.setContent(parsed);
         });
+        const serialised = getMarkdown(editor);
+        documentSessionRef.current.establishInitialVisualBaseline(serialised);
       } catch (error) {
         setSourceMode(true);
         toast.error(
@@ -2002,7 +2104,17 @@ export function Editor({
       // Scroll again in RAF to ensure it takes effect after DOM updates
       scrollContainerRef.current?.scrollTo(0, 0);
 
-      isLoadingRef.current = false;
+      const finalHydratedMarkdown = getMarkdown(editor);
+      documentSessionRef.current?.establishInitialVisualBaseline(
+        finalHydratedMarkdown,
+      );
+      setIsUnsaved(false);
+
+      setTimeout(() => {
+        if (loadedNoteIdRef.current === loadingNoteId) {
+          isLoadingRef.current = false;
+        }
+      }, 50);
 
       if (consumePendingNewNote?.(loadingNoteId)) {
         if (!focusAndSelectTitle(editor)) {
@@ -3554,7 +3666,7 @@ export function Editor({
 
     // Folder mode: show empty state with "New Note" button
     return (
-      <div className="flex-1 flex flex-col bg-bg">
+      <div className="flex-1 flex flex-col bg-bg h-full min-h-0">
         {/* Drag region */}
         {!isWindows && (
           <div
@@ -3676,6 +3788,29 @@ export function Editor({
                 <span className="font-medium">Saved</span>
               </div>
             </Tooltip>
+          )}
+          {!isInternalWorkspaceFile(currentNote?.path, notesFolder) && (
+            <div className="flex items-center gap-1.5 ml-1">
+              <Tooltip content={`Save changes (${mod}${isMac ? "" : "+"}S)`}>
+                <button
+                  onClick={() => {
+                    const noteId = loadedNoteIdRef.current;
+                    if (noteId) void saveImmediately(noteId, "explicit");
+                  }}
+                  className="h-6.5 px-2 flex items-center gap-1 text-[11px] font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-md transition-colors shadow-sm cursor-pointer"
+                >
+                  <span>Save</span>
+                </button>
+              </Tooltip>
+              <Tooltip content={`Save copy to another file (${mod}${isMac ? "" : "+"}Shift+S)`}>
+                <button
+                  onClick={() => void handleSaveAs()}
+                  className="h-6.5 px-2 flex items-center gap-1 text-[11px] font-medium text-text-muted hover:bg-bg-emphasis rounded-md border border-border/50 transition-colors cursor-pointer"
+                >
+                  <span>Save As...</span>
+                </button>
+              </Tooltip>
+            </div>
           )}
           {preserveSourceFormatting && (
             <Tooltip content="Exact source formatting is protected">

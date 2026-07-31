@@ -10,6 +10,8 @@ import { SidebarResizeHandle } from "./components/layout/SidebarResizeHandle";
 import { SIDEBAR_DEFAULT_PX } from "./lib/sidebar";
 import { Editor } from "./components/editor/Editor";
 import { PreviewApp } from "./components/preview/PreviewApp";
+import { TabBar, type TabItem } from "./components/editor/TabBar";
+import { UnsavedChangesModal } from "./components/editor/UnsavedChangesModal";
 import type { Editor as TiptapEditor } from "@tiptap/react";
 import { FolderPicker } from "./components/layout/FolderPicker";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
@@ -69,9 +71,6 @@ function AppContent({
   const [focusMode, setFocusMode] = useState(false);
   const [aiProvider, setAiProvider] = useState<AiProvider>("claude");
   const editorRef = useRef<TiptapEditor | null>(null);
-  const externalFileInitialNoteIdRef = useRef<string | null | undefined>(
-    undefined,
-  );
 
   // Listen for set-notes-folder event from CLI (markdown-editor .)
   // Placed here in AppContent where both NotesContext and ThemeContext are available
@@ -116,27 +115,194 @@ function AppContent({
     if (externalFilePath) onExitExternalFile();
   }, [createNote, externalFilePath, notesFolder, onExitExternalFile]);
 
-  // Opening an external file leaves the managed-note selection intact in the
-  // sidebar. Selecting a different managed note returns to the normal editor.
-  useEffect(() => {
-    if (!externalFilePath || isLoading) {
-      externalFileInitialNoteIdRef.current = undefined;
-      return;
-    }
-    externalFileInitialNoteIdRef.current = selectedNoteId;
-  }, [externalFilePath, isLoading]);
+  const [openTabs, setOpenTabs] = useState<TabItem[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
 
   useEffect(() => {
-    const initialNoteId = externalFileInitialNoteIdRef.current;
-    if (
-      externalFilePath &&
-      !isLoading &&
-      initialNoteId !== undefined &&
-      selectedNoteId !== initialNoteId
-    ) {
-      onExitExternalFile();
+    if (externalFilePath) {
+      const fileName =
+        externalFilePath.substring(
+          Math.max(
+            externalFilePath.lastIndexOf("/"),
+            externalFilePath.lastIndexOf("\\"),
+          ) + 1,
+        ) || "External File";
+      setOpenTabs((prev) => {
+        if (prev.some((t) => t.id === externalFilePath)) return prev;
+        return [
+          ...prev,
+          {
+            id: externalFilePath,
+            title: fileName,
+            path: externalFilePath,
+            isExternal: true,
+          },
+        ];
+      });
+      setActiveTabId(externalFilePath);
+    } else if (selectedNoteId && currentNote) {
+      setOpenTabs((prev) => {
+        const title = currentNote.title || "Untitled";
+        const existingIndex = prev.findIndex((t) => t.id === selectedNoteId);
+        if (existingIndex >= 0) {
+          const updated = [...prev];
+          updated[existingIndex] = {
+            ...updated[existingIndex],
+            title,
+            path: currentNote.path,
+          };
+          return updated;
+        }
+        return [
+          ...prev,
+          {
+            id: selectedNoteId,
+            title,
+            path: currentNote.path,
+            isExternal: false,
+          },
+        ];
+      });
+      setActiveTabId(selectedNoteId);
     }
-  }, [externalFilePath, isLoading, onExitExternalFile, selectedNoteId]);
+  }, [externalFilePath, selectedNoteId, currentNote]);
+
+  const [unsavedModalTab, setUnsavedModalTab] = useState<TabItem | null>(null);
+  const openTabsRef = useRef<TabItem[]>(openTabs);
+  openTabsRef.current = openTabs;
+  const isClosingWindowRef = useRef(false);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    const setupCloseHandler = async () => {
+      try {
+        const appWindow = getCurrentWindow();
+        unlisten = await appWindow.onCloseRequested((event) => {
+          const dirtyTab = openTabsRef.current.find((t) => t.isDirty);
+          if (dirtyTab) {
+            event.preventDefault();
+            isClosingWindowRef.current = true;
+            setActiveTabId(dirtyTab.id);
+            if (!dirtyTab.isExternal) selectNote(dirtyTab.id);
+            setUnsavedModalTab(dirtyTab);
+          }
+        });
+      } catch (err) {
+        console.warn("Window close listener skipped", err);
+      }
+    };
+    setupCloseHandler();
+    return () => unlisten?.();
+  }, [selectNote]);
+
+  useEffect(() => {
+    const handleDirtyChange = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { path: string; isDirty: boolean };
+      if (!detail?.path) return;
+      setOpenTabs((prev) =>
+        prev.map((t) =>
+          t.id === detail.path || t.path === detail.path
+            ? { ...t, isDirty: detail.isDirty }
+            : t,
+        ),
+      );
+    };
+    window.addEventListener("document-dirty-changed", handleDirtyChange);
+    return () => window.removeEventListener("document-dirty-changed", handleDirtyChange);
+  }, []);
+
+  const handleSelectTab = useCallback(
+    (tabId: string) => {
+      setActiveTabId(tabId);
+      const tab = openTabs.find((t) => t.id === tabId);
+      if (!tab) return;
+      if (!tab.isExternal) {
+        selectNote(tab.id);
+      }
+    },
+    [openTabs, selectNote],
+  );
+
+  const performCloseTab = useCallback(
+    (tabId: string) => {
+      setOpenTabs((prev) => {
+        const filtered = prev.filter((t) => t.id !== tabId);
+        if (activeTabId === tabId) {
+          const nextTab = filtered[filtered.length - 1];
+          if (nextTab) {
+            setActiveTabId(nextTab.id);
+            if (!nextTab.isExternal) selectNote(nextTab.id);
+          } else {
+            setActiveTabId(null);
+          }
+        }
+        return filtered;
+      });
+      if (tabId === externalFilePath) {
+        onExitExternalFile();
+      }
+    },
+    [activeTabId, externalFilePath, onExitExternalFile, selectNote],
+  );
+
+  const handleCloseTab = useCallback(
+    (tabId: string, e: React.MouseEvent) => {
+      e.stopPropagation();
+      const tab = openTabs.find((t) => t.id === tabId);
+      if (tab?.isDirty) {
+        setUnsavedModalTab(tab);
+        return;
+      }
+      performCloseTab(tabId);
+    },
+    [openTabs, performCloseTab],
+  );
+
+  const checkNextWindowClose = useCallback(
+    (closedTabId: string) => {
+      if (isClosingWindowRef.current) {
+        const remainingDirty = openTabsRef.current.filter(
+          (t) => t.id !== closedTabId && t.isDirty,
+        );
+        if (remainingDirty.length > 0) {
+          const next = remainingDirty[0];
+          setActiveTabId(next.id);
+          if (!next.isExternal) selectNote(next.id);
+          setUnsavedModalTab(next);
+        } else {
+          isClosingWindowRef.current = false;
+          try {
+            void getCurrentWindow().destroy();
+          } catch {
+            // ignore
+          }
+        }
+      }
+    },
+    [selectNote],
+  );
+
+  const handleModalSave = useCallback(() => {
+    if (!unsavedModalTab) return;
+    window.dispatchEvent(new CustomEvent("trigger-explicit-save"));
+    const tabId = unsavedModalTab.id;
+    setUnsavedModalTab(null);
+    performCloseTab(tabId);
+    checkNextWindowClose(tabId);
+  }, [unsavedModalTab, performCloseTab, checkNextWindowClose]);
+
+  const handleModalDontSave = useCallback(() => {
+    if (!unsavedModalTab) return;
+    const tabId = unsavedModalTab.id;
+    setUnsavedModalTab(null);
+    performCloseTab(tabId);
+    checkNextWindowClose(tabId);
+  }, [unsavedModalTab, performCloseTab, checkNextWindowClose]);
+
+  const handleModalCancel = useCallback(() => {
+    setUnsavedModalTab(null);
+    isClosingWindowRef.current = false;
+  }, []);
 
   const toggleSettings = useCallback(() => {
     setView((prev) => (prev === "settings" ? "notes" : "settings"));
@@ -535,24 +701,36 @@ function AppContent({
               />
               {sidebarVisible && !focusMode && <SidebarResizeHandle />}
             </div>
-            {externalFilePath ? (
-              <PreviewApp
-                filePath={externalFilePath}
-                onToggleSidebar={toggleSidebar}
-                sidebarVisible={sidebarVisible}
-                focusMode={focusMode}
-                onExitPreview={onExitExternalFile}
+            <div className="flex-1 flex flex-col min-w-0 h-full overflow-hidden">
+              <TabBar
+                tabs={openTabs}
+                activeTabId={activeTabId}
+                onSelectTab={handleSelectTab}
+                onCloseTab={handleCloseTab}
+                onNewTab={createManagedNote}
               />
-            ) : (
-              <Editor
-                onToggleSidebar={toggleSidebar}
-                sidebarVisible={sidebarVisible}
-                focusMode={focusMode}
-                onEditorReady={(editor) => {
-                  editorRef.current = editor;
-                }}
-              />
-            )}
+              <div className="flex-1 min-h-0 relative">
+                {externalFilePath ? (
+                  <PreviewApp
+                    key={externalFilePath}
+                    filePath={externalFilePath}
+                    onToggleSidebar={toggleSidebar}
+                    sidebarVisible={sidebarVisible}
+                    focusMode={focusMode}
+                    onExitPreview={onExitExternalFile}
+                  />
+                ) : (
+                  <Editor
+                    onToggleSidebar={toggleSidebar}
+                    sidebarVisible={sidebarVisible}
+                    focusMode={focusMode}
+                    onEditorReady={(editor) => {
+                      editorRef.current = editor;
+                    }}
+                  />
+                )}
+              </div>
+            </div>
           </>
         )}
       </div>
@@ -595,6 +773,14 @@ function AppContent({
       />
 
       <CommentsModal />
+
+      <UnsavedChangesModal
+        open={Boolean(unsavedModalTab)}
+        fileName={unsavedModalTab?.title || "Untitled.md"}
+        onSave={handleModalSave}
+        onDontSave={handleModalDontSave}
+        onCancel={handleModalCancel}
+      />
 
       {/* AI Editing Overlay */}
       {aiEditing && (

@@ -5,7 +5,7 @@ import test from "node:test";
 const projectFile = (relativePath: string) =>
   readFileSync(new URL(`../../${relativePath}`, import.meta.url), "utf8");
 
-test("v1.0.5 metadata, test runner, and development endpoint are internally consistent", () => {
+test("v1.0.6 metadata, test runner, and development endpoint are internally consistent", () => {
   const packageJson = JSON.parse(projectFile("package.json")) as {
     version: string;
     license: string;
@@ -28,15 +28,15 @@ test("v1.0.5 metadata, test runner, and development endpoint are internally cons
   const license = projectFile("LICENSE");
   const notice = projectFile("NOTICE");
 
-  assert.equal(packageJson.version, "1.0.5");
-  assert.equal(packageLock.version, "1.0.5");
-  assert.equal(packageLock.packages[""].version, "1.0.5");
+  assert.equal(packageJson.version, "1.0.6");
+  assert.equal(packageLock.version, "1.0.6");
+  assert.equal(packageLock.packages[""].version, "1.0.6");
   assert.equal(packageJson.license, "MIT");
   assert.equal(packageLock.packages[""].license, "MIT");
-  assert.equal(tauriConfig.version, "1.0.5");
-  assert.match(cargoToml, /^version = "1\.0\.5"$/m);
+  assert.equal(tauriConfig.version, "1.0.6");
+  assert.match(cargoToml, /^version = "1\.0\.6"$/m);
   assert.match(cargoToml, /^license = "MIT"$/m);
-  assert.match(cargoLock, /name = "markdown-editor"\r?\nversion = "1\.0\.5"/);
+  assert.match(cargoLock, /name = "markdown-editor"\r?\nversion = "1\.0\.6"/);
   assert.equal(tauriConfig.build.devUrl, "http://localhost:3000");
   assert.equal(
     packageJson.scripts.test,
@@ -44,12 +44,12 @@ test("v1.0.5 metadata, test runner, and development endpoint are internally cons
   );
   assert.equal(packageJson.engines.node, ">=22.6.0");
   assert.match(releaseWorkflow, /Markdown Editor v__VERSION__/);
-  assert.doesNotMatch(releaseWorkflow, /v1\.0\.4/);
-  assert.match(readme, /## Current release: v1\.0\.5/);
+  assert.doesNotMatch(releaseWorkflow, /v1\.0\.5/);
+  assert.match(readme, /## Current release: v1\.0\.6/);
   assert.match(readme, /releases\/latest/);
   assert.match(readme, /Node\.js 22\.6\+/);
-  assert.doesNotMatch(readme, /releases\/tag\/v1\.0\.4/);
-  assert.match(changelog, /^## \[1\.0\.5\] - 2026-07-31$/m);
+  assert.doesNotMatch(readme, /releases\/tag\/v1\.0\.5/);
+  assert.match(changelog, /^## \[1\.0\.6\] - 2026-08-01$/m);
   assert.match(license, /^MIT License$/m);
   assert.match(license, /Copyright \(c\) 2026 Ali Mozaffari/);
   assert.match(notice, /Scratch by Eric Li/);

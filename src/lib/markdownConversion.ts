@@ -229,9 +229,19 @@ export function validateMarkdownRoundTrip(
     collectDocumentText(reparsed, actualText);
     const expectedSequence = normaliseText(expectedText.join(" "));
     const actualSequence = normaliseText(actualText.join(" "));
-    const missingFragment = expectedText.find(
-      (fragment) => !actualSequence.includes(normaliseText(fragment)),
-    );
+    const missingFragment = expectedText.find((fragment) => {
+      const norm = normaliseText(fragment);
+      if (!norm) return false;
+      if (actualSequence.includes(norm)) return false;
+      const subChunks = norm
+        .split(/(?:[\r\n]+|[.!?:]\s+|\s{2,})/)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 3);
+      if (subChunks.length > 0) {
+        return subChunks.some((sub) => !actualSequence.includes(sub));
+      }
+      return true;
+    });
 
     return {
       ok: false,

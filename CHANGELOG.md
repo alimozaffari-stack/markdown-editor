@@ -2,6 +2,21 @@
 
 All notable changes to Markdown Editor are recorded here.
 
+## [1.0.6] - 2026-08-01
+
+### Added
+
+- **Multi-Document Tab Bar System:** Supports opening multiple managed workspace notes and external files as tabs simultaneously. Double-clicking any `.md` file in Windows File Explorer automatically opens a new tab in the running window without closing existing files.
+- **Domain-Separated Save Workflows:** Retains continuous debounced background autosave (500ms) for managed workspace notes, while requiring explicit manual save (`Ctrl+S` / Save button / Save As `Ctrl+Shift+S`) for external standalone files.
+- **Movable Sidebar Splitter UI:** Re-architected sidebar into a vertically stacked split panel with a draggable horizontal divider handle separating Recent External Files (top pane) and Workspace Notes (bottom pane) with single-column scrollbar alignment.
+- **Unsaved Close Protection Modal:** Prompts for confirmation (**Save**, **Don't Save**, **Cancel**) when closing dirty external file tabs or closing the app window.
+
+### Fixed
+
+- Cross-volume atomic file replacement (`MOVEFILE_COPY_ALLOWED` in `src-tauri/src/document.rs`) supporting disk writes across different drive volumes (`C:`, `D:`, `G:`).
+- Suppressed false positive round-trip validation toasts when visible document character counts are 100% identical.
+- Fixed vertical centering for empty state logo frame.
+
 ## [1.0.5] - 2026-07-31
 
 ### Added

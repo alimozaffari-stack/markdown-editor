@@ -60,6 +60,36 @@ export function Sidebar({ onOpenSettings, onCreateNote }: SidebarProps) {
   const [dragCount, setDragCount] = useState(1);
   const [multiSelectedNoteIds, setMultiSelectedNoteIds] = useState<Set<string>>(new Set());
   const [lastClickedNoteId, setLastClickedNoteId] = useState<string | null>(null);
+  const [recentHeight, setRecentHeight] = useState<number>(() => {
+    const saved = localStorage.getItem("sidebar_recent_height");
+    return saved ? Math.max(80, Math.min(400, parseInt(saved, 10))) : 160;
+  });
+  const isResizingRef = useRef(false);
+
+  const handleResizeStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    isResizingRef.current = true;
+    const startY = e.clientY;
+    const startHeight = recentHeight;
+
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      if (!isResizingRef.current) return;
+      const deltaY = moveEvent.clientY - startY;
+      const newHeight = Math.max(80, Math.min(400, startHeight + deltaY));
+      setRecentHeight(newHeight);
+      localStorage.setItem("sidebar_recent_height", String(newHeight));
+    };
+
+    const handleMouseUp = () => {
+      isResizingRef.current = false;
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+  }, [recentHeight]);
+
   const debounceRef = useRef<number | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const multiSelectedRef = useRef(multiSelectedNoteIds) as RefObject<Set<string>>;
@@ -445,7 +475,7 @@ export function Sidebar({ onOpenSettings, onCreateNote }: SidebarProps) {
         </div>
       </div>
       {/* Scrollable area with search and notes */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
         {/* Search - sticky at top */}
         {searchOpen && (
           <div className="sticky top-0 z-10 px-2 pt-2 bg-bg-secondary">
@@ -472,15 +502,34 @@ export function Sidebar({ onOpenSettings, onCreateNote }: SidebarProps) {
           </div>
         )}
 
-        {!searchOpen && <RecentExternalFiles />}
+        {!searchOpen && (
+          <>
+            <div
+              style={{ height: `${recentHeight}px` }}
+              className="shrink-0 overflow-y-auto border-b border-border/30"
+            >
+              <RecentExternalFiles />
+            </div>
+            {/* Movable Horizontal Splitter Bar */}
+            <div
+              onMouseDown={handleResizeStart}
+              className="h-1.5 w-full cursor-row-resize hover:bg-amber-500/40 active:bg-amber-500/70 transition-colors flex items-center justify-center shrink-0 group select-none"
+              title="Drag to resize panel"
+            >
+              <div className="w-8 h-0.5 rounded-full bg-border group-hover:bg-amber-500 transition-colors" />
+            </div>
+          </>
+        )}
 
         {/* Note list */}
-        <NoteList
-          multiSelectedNoteIds={multiSelectedNoteIds}
-          setMultiSelectedNoteIds={setMultiSelectedNoteIds}
-          lastClickedNoteId={lastClickedNoteId}
-          setLastClickedNoteId={setLastClickedNoteId}
-        />
+        <div className="flex-1 min-h-0 overflow-y-auto">
+          <NoteList
+            multiSelectedNoteIds={multiSelectedNoteIds}
+            setMultiSelectedNoteIds={setMultiSelectedNoteIds}
+            lastClickedNoteId={lastClickedNoteId}
+            setLastClickedNoteId={setLastClickedNoteId}
+          />
+        </div>
       </div>
 
       {/* Footer with git status, commit, and settings */}
