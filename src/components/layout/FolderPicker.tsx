@@ -1,12 +1,19 @@
 import { open } from "@tauri-apps/plugin-dialog";
+import { useEffect, useState } from "react";
 import { useNotes } from "../../context/NotesContext";
 import { useTheme } from "../../context/ThemeContext";
 import { Button } from "../ui";
 import { isWindows } from "../../lib/platform";
+import { getAppVersionLabel } from "../../lib/appVersion";
 
 export function FolderPicker() {
   const { setNotesFolder } = useNotes();
   const { reloadSettings } = useTheme();
+  const [appVersion, setAppVersion] = useState("Version…");
+
+  useEffect(() => {
+    void getAppVersionLabel().then(setAppVersion);
+  }, []);
 
   const handleSelectFolder = async () => {
     try {
@@ -52,6 +59,12 @@ export function FolderPicker() {
           >
             Markdown Editor is an offline-first Markdown application. Your notes are simply stored
             on your computer as markdown files.
+          </p>
+          <p
+            className="text-xs text-text-muted/70 mb-5 animate-fade-in-up"
+            style={{ animationDelay: "150ms" }}
+          >
+            Markdown Editor {appVersion}
           </p>
           <div
             className="animate-fade-in-up"

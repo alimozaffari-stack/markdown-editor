@@ -11,11 +11,15 @@ test("rapid saves are serialised and each request uses the preceding snapshot", 
   const queue = createRebasedSaveQueue<string, string, Snapshot>();
   queue.setBase("note", { hash: "baseline" });
 
-  let releaseFirst!: () => void;
+  let releaseFirst: () => void = () => {
+    throw new Error("first-save release callback was not initialised");
+  };
   const firstCanFinish = new Promise<void>((resolve) => {
     releaseFirst = resolve;
   });
-  let firstStarted!: () => void;
+  let firstStarted: () => void = () => {
+    throw new Error("first-save start callback was not initialised");
+  };
   const firstDidStart = new Promise<void>((resolve) => {
     firstStarted = resolve;
   });

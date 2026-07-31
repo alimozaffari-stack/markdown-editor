@@ -35,7 +35,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: lts/*
+          node-version: 22.6.0
           cache: npm
 
       - name: Install Rust stable
@@ -62,15 +62,17 @@ jobs:
           tagName: v__VERSION__
           releaseName: "Markdown Editor v__VERSION__"
           releaseBody: |
-            Markdown Editor v1.0.4 makes paste and saving fail-safe.
+            Markdown Editor v__VERSION__ improves external-file continuity and release clarity.
 
+            - Keeps a private, local list of the latest 50 externally opened Markdown files; originals remain in place and can be removed from the list individually or all at once.
+            - Shows the packaged application version on the welcome screen, in the sidebar, and in Settings.
             - Preserves structured Gemini Canvas and rich HTML paste, with literal fallback if conversion loses content.
             - Adds **Paste exactly** and per-document **Preserve source formatting**.
             - Prevents clean documents and programme-driven editor changes from writing files.
             - Uses baseline conflict detection, recovery drafts, validated temporary files and atomic replacement.
             - Aligns Tiptap at 3.29.2 and replaces all internal and package branding with the authorised logo.
 
-            Windows users can choose the `.exe` installer or `.msi` package. Linux packages are also attached. No macOS binary is published for v1.0.4.
+            Windows users can choose the `.exe` installer or `.msi` package. Linux packages are also attached. No macOS binary is published for this release.
           releaseDraft: false
           prerelease: false
           updaterJsonPreferNsis: true

@@ -1,0 +1,17 @@
+# Markdown Editor notice and provenance
+
+Copyright (c) 2026 Ali Mozaffari
+
+Markdown Editor is an independently maintained edition derived from
+[Scratch by Eric Li](https://github.com/erictli/scratch). The upstream
+repository's public README declares Scratch to be MIT-licensed. Original
+authors and contributors retain their applicable copyright and licence
+notices.
+
+The MIT License in this repository applies to Markdown Editor contributions
+for which its maintainers hold the relevant rights. This distribution also
+contains third-party dependencies; their licences remain applicable and are
+recorded in their respective packages.
+
+Markdown Editor is not affiliated with, endorsed by, or supported by Scratch
+or its upstream contributors.
