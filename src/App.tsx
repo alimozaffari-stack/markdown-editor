@@ -184,12 +184,15 @@ function AppContent({
       try {
         const appWindow = getCurrentWindow();
         unlisten = await appWindow.onCloseRequested((event) => {
-          const dirtyTab = openTabsRef.current.find((t) => t.isDirty);
+          // Only block close for external files that need manual save.
+          // Managed workspace notes autosave, so they never block window close.
+          const dirtyTab = openTabsRef.current.find(
+            (t) => t.isExternal && t.isDirty,
+          );
           if (dirtyTab) {
             event.preventDefault();
             isClosingWindowRef.current = true;
             setActiveTabId(dirtyTab.id);
-            if (!dirtyTab.isExternal) selectNote(dirtyTab.id);
             setUnsavedModalTab(dirtyTab);
           }
         });
@@ -199,7 +202,7 @@ function AppContent({
     };
     setupCloseHandler();
     return () => unlisten?.();
-  }, [selectNote]);
+  }, []);
 
   useEffect(() => {
     const handleDirtyChange = (e: Event) => {
@@ -272,12 +275,11 @@ function AppContent({
     (closedTabId: string) => {
       if (isClosingWindowRef.current) {
         const remainingDirty = openTabsRef.current.filter(
-          (t) => t.id !== closedTabId && t.isDirty,
+          (t) => t.id !== closedTabId && t.isExternal && t.isDirty,
         );
         if (remainingDirty.length > 0) {
           const next = remainingDirty[0];
           setActiveTabId(next.id);
-          if (!next.isExternal) selectNote(next.id);
           setUnsavedModalTab(next);
         } else {
           isClosingWindowRef.current = false;
@@ -289,7 +291,7 @@ function AppContent({
         }
       }
     },
-    [selectNote],
+    [],
   );
 
   const handleModalSave = useCallback(() => {

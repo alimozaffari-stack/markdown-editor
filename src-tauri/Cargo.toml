@@ -1,6 +1,6 @@
 [package]
 name = "markdown-editor"
-version = "1.0.7"
+version = "1.0.8"
 description = "An independent offline Markdown editor"
 authors = ["Ali Mozaffari"]
 license = "MIT"
@@ -43,3 +43,4 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"
+

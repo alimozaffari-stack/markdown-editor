@@ -1,7 +1,7 @@
 {
   "name": "markdown-editor",
   "private": true,
-  "version": "1.0.7",
+  "version": "1.0.8",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -75,4 +75,5 @@
     "vite": "^7.0.4"
   }
 }
+
 
