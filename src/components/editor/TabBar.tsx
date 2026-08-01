@@ -54,7 +54,11 @@ export function TabBar({
                 <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0" title="Unsaved changes" />
               )}
               <button
-                onClick={(e) => onCloseTab(tab.id, e)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  e.preventDefault();
+                  onCloseTab(tab.id, e);
+                }}
                 className={`p-0.5 rounded-sm hover:bg-bg-emphasis text-text-muted hover:text-text transition-colors opacity-0 group-hover:opacity-100 ${
                   isActive ? "opacity-70" : ""
                 }`}

@@ -117,9 +117,13 @@ function AppContent({
 
   const [openTabs, setOpenTabs] = useState<TabItem[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  // Track tabs explicitly closed by the user so the sync effect doesn't re-add them.
+  const closedTabIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     if (externalFilePath) {
+      // Re-opening an external file clears its closed status.
+      closedTabIdsRef.current.delete(externalFilePath);
       const fileName =
         externalFilePath.substring(
           Math.max(
@@ -141,6 +145,8 @@ function AppContent({
       });
       setActiveTabId(externalFilePath);
     } else if (selectedNoteId && currentNote) {
+      // Don't re-open a tab the user just closed.
+      if (closedTabIdsRef.current.has(selectedNoteId)) return;
       setOpenTabs((prev) => {
         const title = currentNote.title || "Untitled";
         const existingIndex = prev.findIndex((t) => t.id === selectedNoteId);
@@ -225,12 +231,16 @@ function AppContent({
 
   const performCloseTab = useCallback(
     (tabId: string) => {
+      // Mark this tab as explicitly closed so the sync effect won't re-add it.
+      closedTabIdsRef.current.add(tabId);
       setOpenTabs((prev) => {
         const filtered = prev.filter((t) => t.id !== tabId);
         if (activeTabId === tabId) {
           const nextTab = filtered[filtered.length - 1];
           if (nextTab) {
             setActiveTabId(nextTab.id);
+            // If switching to a managed note, clear its closed status first.
+            closedTabIdsRef.current.delete(nextTab.id);
             if (!nextTab.isExternal) selectNote(nextTab.id);
           } else {
             setActiveTabId(null);
