@@ -4235,19 +4235,30 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Handle drag-and-drop of .md files onto any window
-            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
-                let app = window.app_handle();
-                for path in paths {
-                    if is_markdown_extension(path)
-                        && path.is_file()
-                        && !try_select_in_notes_folder(app, path)
-                    {
-                        if let Err(error) = open_external_file_in_main(app, path) {
-                            eprintln!("Failed to open dropped markdown file {path:?}: {error}");
+            match event {
+                // Intercept window close at the OS level and delegate to the frontend.
+                // The frontend listens for "app-close-requested" and calls destroy()
+                // when it is ready (immediately if no unsaved external files, or after
+                // the save/discard dialog for dirty external files).
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let _ = window.app_handle().emit("app-close-requested", ());
+                }
+                // Handle drag-and-drop of .md files onto any window
+                tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
+                    let app = window.app_handle();
+                    for path in paths {
+                        if is_markdown_extension(path)
+                            && path.is_file()
+                            && !try_select_in_notes_folder(app, path)
+                        {
+                            if let Err(error) = open_external_file_in_main(app, path) {
+                                eprintln!("Failed to open dropped markdown file {path:?}: {error}");
+                            }
                         }
                     }
                 }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![

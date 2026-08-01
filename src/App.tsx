@@ -180,27 +180,38 @@ function AppContent({
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    const setupCloseHandler = async () => {
+    const setup = async () => {
       try {
-        const appWindow = getCurrentWindow();
-        unlisten = await appWindow.onCloseRequested((event) => {
-          // Only block close for external files that need manual save.
-          // Managed workspace notes autosave, so they never block window close.
-          const dirtyTab = openTabsRef.current.find(
-            (t) => t.isExternal && t.isDirty,
-          );
-          if (dirtyTab) {
-            event.preventDefault();
-            isClosingWindowRef.current = true;
-            setActiveTabId(dirtyTab.id);
-            setUnsavedModalTab(dirtyTab);
+        // Listen for the Rust-level close interception.
+        // Rust always prevents the OS close and fires this event so we can
+        // decide: destroy() immediately (no dirty external files) or show the
+        // save/discard dialog first.
+        const { listen } = await import("@tauri-apps/api/event");
+        unlisten = await listen("app-close-requested", async () => {
+          try {
+            const dirtyExternalTab = openTabsRef.current.find(
+              (t) => t.isExternal && t.isDirty,
+            );
+            if (dirtyExternalTab) {
+              isClosingWindowRef.current = true;
+              setActiveTabId(dirtyExternalTab.id);
+              setUnsavedModalTab(dirtyExternalTab);
+              // destroy() will be called by checkNextWindowClose after the dialog.
+            } else {
+              // Nothing to save — close immediately.
+              await getCurrentWindow().destroy();
+            }
+          } catch (err) {
+            console.error("app-close-requested handler error:", err);
+            // Ensure the window can still close on error.
+            try { await getCurrentWindow().destroy(); } catch { /* ignore */ }
           }
         });
       } catch (err) {
-        console.warn("Window close listener skipped", err);
+        console.warn("Window close listener setup failed:", err);
       }
     };
-    setupCloseHandler();
+    setup();
     return () => unlisten?.();
   }, []);
 
