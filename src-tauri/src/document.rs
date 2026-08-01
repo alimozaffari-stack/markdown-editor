@@ -221,16 +221,49 @@ fn snapshot_from_bytes(
             DocumentBom::Utf16be,
         )
     } else {
-        (
-            String::from_utf8(bytes.to_vec()).map_err(|_| {
-                SaveFailure::new(
-                    SaveFailureKind::UnsupportedEncoding,
-                    "Only UTF-8 and BOM-marked UTF-16 Markdown files are supported",
+        match String::from_utf8(bytes.to_vec()) {
+            Ok(utf8_text) => (utf8_text, DocumentEncoding::Utf8, DocumentBom::None),
+            Err(_) => {
+                // Check if file is UTF-16LE without BOM (e.g. ASCII characters alternate with 0x00)
+                if bytes.len() >= 4 && bytes.len() % 2 == 0 {
+                    let zero_even = bytes.iter().step_by(2).filter(|&&b| b == 0).count();
+                    let zero_odd = bytes.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
+                    let half = bytes.len() / 4; // At least ~50% null bytes expected for English/ASCII UTF-16
+                    if zero_odd >= half {
+                        if let Ok(decoded) = decode_utf16(bytes, true) {
+                            return Ok(DocumentSnapshot {
+                                line_ending: detect_line_ending(&decoded),
+                                content: decoded,
+                                hash: sha256_bytes(bytes),
+                                revision: revision_from_metadata(metadata),
+                                encoding: DocumentEncoding::Utf16le,
+                                bom: DocumentBom::None,
+                            });
+                        }
+                    } else if zero_even >= half {
+                        if let Ok(decoded) = decode_utf16(bytes, false) {
+                            return Ok(DocumentSnapshot {
+                                line_ending: detect_line_ending(&decoded),
+                                content: decoded,
+                                hash: sha256_bytes(bytes),
+                                revision: revision_from_metadata(metadata),
+                                encoding: DocumentEncoding::Utf16be,
+                                bom: DocumentBom::None,
+                            });
+                        }
+                    }
+                }
+
+                // Fallback for legacy ANSI / Windows-1252 / ISO-8859-1 encodings:
+                // Decode using Windows-1252 so non-UTF-8 characters (smart quotes, accents, non-ASCII symbols) load cleanly.
+                let (cow, _, _) = encoding_rs::WINDOWS_1252.decode(bytes);
+                (
+                    cow.into_owned(),
+                    DocumentEncoding::Utf8,
+                    DocumentBom::None,
                 )
-            })?,
-            DocumentEncoding::Utf8,
-            DocumentBom::None,
-        )
+            }
+        }
     };
 
     Ok(DocumentSnapshot {

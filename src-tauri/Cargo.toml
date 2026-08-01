@@ -1,6 +1,6 @@
 [package]
 name = "markdown-editor"
-version = "1.0.8"
+version = "1.0.9"
 description = "An independent offline Markdown editor"
 authors = ["Ali Mozaffari"]
 license = "MIT"
@@ -34,6 +34,7 @@ regex = "1"
 walkdir = "2"
 tauri-plugin-single-instance = "2"
 chrono = "0.4"
+encoding_rs = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3", features = ["NSUserDefaults", "NSString"] }
@@ -43,4 +44,5 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"
+
 

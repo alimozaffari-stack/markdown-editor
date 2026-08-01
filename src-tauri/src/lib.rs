@@ -4104,6 +4104,7 @@ fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) {
     }
 
     if let Some(main_window) = app.get_webview_window("main") {
+        let _ = main_window.unminimize();
         let _ = main_window.show();
         let _ = main_window.set_focus();
     }
