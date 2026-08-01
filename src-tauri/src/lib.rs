@@ -37,6 +37,11 @@ pub struct CliStatus {
     pub path: Option<String>,
 }
 
+#[tauri::command]
+fn terminate_application(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 // Full note content
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Note {
@@ -4262,6 +4267,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            terminate_application,
             get_notes_folder,
             set_notes_folder,
             list_notes,

@@ -199,7 +199,13 @@ function AppContent({
               // destroy() will be called by checkNextWindowClose after the dialog.
             } else {
               // Nothing to save — close immediately.
-              await getCurrentWindow().destroy();
+try {
+  await getCurrentWindow().destroy();
+} catch (destroyErr) {
+  console.warn("destroy failed, invoking backend termination", destroyErr);
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("terminate_application");
+}
             }
           } catch (err) {
             console.error("app-close-requested handler error:", err);
