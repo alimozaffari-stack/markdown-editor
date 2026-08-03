@@ -4,6 +4,7 @@ import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "katex/dist/katex.min.css";
+import "./index.css";
 import App from "./App";
 import "./App.css";
 import { rememberRecentExternalFile } from "./lib/recentExternalFiles";

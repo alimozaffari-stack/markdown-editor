@@ -169,6 +169,32 @@ body {
   scrollbar-gutter: stable;
 }
 
+/* Custom Visible Vertical Scrollbar for Main Editor Scroll Area */
+[data-editor-scroll] {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(120, 113, 108, 0.5) transparent;
+}
+
+[data-editor-scroll]::-webkit-scrollbar {
+  width: 10px !important;
+}
+
+[data-editor-scroll]::-webkit-scrollbar-track {
+  background: transparent !important;
+}
+
+[data-editor-scroll]::-webkit-scrollbar-thumb {
+  background: rgba(120, 113, 108, 0.45) !important;
+  border-radius: 5px !important;
+  border: 2px solid transparent !important;
+  background-clip: padding-box !important;
+}
+
+[data-editor-scroll]::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 113, 108, 0.8) !important;
+  background-clip: padding-box !important;
+}
+
 /* Link tooltip in editor */
 .prose a {
   position: relative;
