@@ -46,6 +46,7 @@
 /* Custom Scrollbar for Editor Scroll Area */
 [data-editor-scroll] {
   scrollbar-width: thin;
-  scrollbar-color: rgba(100, 100, 100, 0.55) transparent;
+  scrollbar-color: #888888 transparent;
 }
+
 

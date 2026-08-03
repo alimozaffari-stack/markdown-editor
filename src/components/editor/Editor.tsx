@@ -3984,7 +3984,7 @@ export function Editor({
         <div
           data-editor-scroll
           ref={scrollContainerRef}
-          className="flex-1 h-full overflow-y-auto overflow-x-hidden relative"
+          className="flex-1 h-full overflow-y-scroll overflow-x-hidden relative"
           dir={textDirection}
         >
           {sourceMode ? (
