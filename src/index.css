@@ -45,25 +45,7 @@
 
 /* Custom Scrollbar for Editor Scroll Area */
 [data-editor-scroll] {
-  scrollbar-width: thin !important;
-  scrollbar-color: rgba(100, 100, 100, 0.5) rgba(0, 0, 0, 0.05) !important;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(100, 100, 100, 0.55) transparent;
 }
 
-[data-editor-scroll]::-webkit-scrollbar {
-  -webkit-appearance: none !important;
-  width: 12px !important;
-}
-[data-editor-scroll]::-webkit-scrollbar-track {
-  background: rgba(0, 0, 0, 0.06) !important;
-  border-radius: 6px !important;
-}
-[data-editor-scroll]::-webkit-scrollbar-thumb {
-  background-color: rgba(100, 100, 100, 0.5) !important;
-  border-radius: 6px !important;
-  border: 2px solid transparent !important;
-  background-clip: content-box !important;
-  min-height: 40px !important;
-}
-[data-editor-scroll]::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(100, 100, 100, 0.8) !important;
-}
