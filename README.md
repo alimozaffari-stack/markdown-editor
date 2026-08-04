@@ -12,7 +12,7 @@ releases, support and roadmap are maintained here.
 
 [Download the current release](https://github.com/alimozaffari-stack/markdown-editor/releases/latest) · [All releases](https://github.com/alimozaffari-stack/markdown-editor/releases) · [Source code](https://github.com/alimozaffari-stack/markdown-editor)
 
-## Current release: v1.1.5
+## Current release: v1.1.6
 
 The [GitHub Releases page](https://github.com/alimozaffari-stack/markdown-editor/releases)
 is the only authoritative location for downloadable installers and packages.
