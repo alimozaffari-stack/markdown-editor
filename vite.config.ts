@@ -4,6 +4,8 @@ import tailwindcss from "@tailwindcss/vite";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+// @ts-expect-error process is a nodejs global
+const defaultPort = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -13,11 +15,11 @@ export default defineConfig(async () => ({
   //
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
-  // 2. dev server configuration for AI Studio web environment
+  // 2. dev server configuration for local & web environment (dynamic port allocation)
   server: {
-    port: 3000,
-    strictPort: true,
-    host: "0.0.0.0",
+    port: defaultPort,
+    strictPort: false,
+    host: host || "0.0.0.0",
     allowedHosts: true,
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`

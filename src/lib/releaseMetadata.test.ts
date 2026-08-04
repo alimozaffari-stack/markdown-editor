@@ -5,7 +5,7 @@ import test from "node:test";
 const projectFile = (relativePath: string) =>
   readFileSync(new URL(`../../${relativePath}`, import.meta.url), "utf8");
 
-test("v1.0.6 metadata, test runner, and development endpoint are internally consistent", () => {
+test("metadata, test runner, and development endpoint are internally consistent", () => {
   const packageJson = JSON.parse(projectFile("package.json")) as {
     version: string;
     license: string;
@@ -28,15 +28,15 @@ test("v1.0.6 metadata, test runner, and development endpoint are internally cons
   const license = projectFile("LICENSE");
   const notice = projectFile("NOTICE");
 
-  assert.equal(packageJson.version, "1.0.6");
-  assert.equal(packageLock.version, "1.0.6");
-  assert.equal(packageLock.packages[""].version, "1.0.6");
+  const currentVersion = packageJson.version;
+  assert.equal(packageLock.version, currentVersion);
+  assert.equal(packageLock.packages[""].version, currentVersion);
   assert.equal(packageJson.license, "MIT");
   assert.equal(packageLock.packages[""].license, "MIT");
-  assert.equal(tauriConfig.version, "1.0.6");
-  assert.match(cargoToml, /^version = "1\.0\.6"$/m);
+  assert.equal(tauriConfig.version, currentVersion);
+  assert.match(cargoToml, new RegExp(`^version = "${currentVersion}"$`, "m"));
   assert.match(cargoToml, /^license = "MIT"$/m);
-  assert.match(cargoLock, /name = "markdown-editor"\r?\nversion = "1\.0\.6"/);
+  assert.match(cargoLock, new RegExp(`name = "markdown-editor"\\r?\\nversion = "${currentVersion}"`));
   assert.equal(tauriConfig.build.devUrl, "http://localhost:3000");
   assert.equal(
     packageJson.scripts.test,
@@ -45,7 +45,7 @@ test("v1.0.6 metadata, test runner, and development endpoint are internally cons
   assert.equal(packageJson.engines.node, ">=22.6.0");
   assert.match(releaseWorkflow, /Markdown Editor v__VERSION__/);
   assert.doesNotMatch(releaseWorkflow, /v1\.0\.5/);
-  assert.match(readme, /## Current release: v1\.0\.6/);
+  assert.match(readme, new RegExp(`## Current release: v${currentVersion.replace(/\./g, "\\.")}`));
   assert.match(readme, /releases\/latest/);
   assert.match(readme, /Node\.js 22\.6\+/);
   assert.doesNotMatch(readme, /releases\/tag\/v1\.0\.5/);

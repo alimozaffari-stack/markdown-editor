@@ -47,16 +47,16 @@ export function EditorWidthHandles({ containerRef }: EditorWidthHandlesProps) {
   // Compute handle offset based on container and editor width
   const updateHandleOffset = useCallback(() => {
     if (!containerRef.current) return;
-    const containerWidth = containerRef.current.clientWidth;
+    const cWidth = containerRef.current.clientWidth;
     const proseMirror =
       containerRef.current.querySelector<HTMLElement>(".ProseMirror");
     if (proseMirror) {
       const maxWidth = getComputedStyle(proseMirror).maxWidth;
       if (maxWidth && maxWidth !== "none") {
         const editorPx =
-          maxWidth === "100%" ? containerWidth : parseFloat(maxWidth);
-        const clampedEditor = Math.min(editorPx, containerWidth);
-        setHandleOffset((containerWidth - clampedEditor) / 2);
+          maxWidth === "100%" ? cWidth : parseFloat(maxWidth);
+        const clampedEditor = Math.min(editorPx, cWidth);
+        setHandleOffset((cWidth - clampedEditor) / 2);
         return;
       }
     }
@@ -224,7 +224,9 @@ export function EditorWidthHandles({ containerRef }: EditorWidthHandlesProps) {
           "absolute top-0 h-full w-3 cursor-col-resize pointer-events-auto group",
           isDragging && "z-20",
         )}
-        style={{ right: `${handleOffset - 6}px` }}
+        style={{
+          right: `${handleOffset - 6}px`,
+        }}
         onPointerDown={(e) => handlePointerDown("right", e)}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
