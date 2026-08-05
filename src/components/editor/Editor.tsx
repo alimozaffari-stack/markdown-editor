@@ -100,7 +100,7 @@ import { cn } from "../../lib/utils";
 import { plainTextFromMarkdown } from "../../lib/plainText";
 import { Button, IconButton, ToolbarButton, Tooltip } from "../ui";
 import * as notesService from "../../services/notes";
-import { downloadPdf, downloadMarkdown } from "../../services/pdf";
+import { downloadPdf, downloadMarkdown, exportComments } from "../../services/pdf";
 import type { Settings } from "../../types/note";
 import {
   BoldIcon,
@@ -3005,6 +3005,24 @@ export function Editor({
     }
   }, [editor, currentNote, getMarkdown]);
 
+  const handleExportComments = useCallback(async () => {
+    if (!currentNote) return;
+    const comments = notesCtx?.commentsMap[currentNote.id] || [];
+    if (comments.length === 0) {
+      toast.info("No comments to export");
+      return;
+    }
+    try {
+      const saved = await exportComments(comments, currentNote.title, currentNote.id);
+      if (saved) {
+        toast.success("Comments exported successfully");
+      }
+    } catch (error) {
+      console.error("Failed to export comments:", error);
+      toast.error("Failed to export comments");
+    }
+  }, [currentNote, notesCtx]);
+
   // Toggle source mode — computes anchor data and toggles state;
   // focus/scroll restoration happens in the useLayoutEffect below.
   const toggleSourceMode = useCallback(() => {
@@ -3974,6 +3992,13 @@ export function Editor({
                 >
                   <DownloadIcon className="w-4 h-4 stroke-[1.6]" />
                   Export Markdown
+                </DropdownMenu.Item>
+                <DropdownMenu.Item
+                  className="px-3 py-1.5 text-sm text-text cursor-pointer outline-none hover:bg-bg-muted focus:bg-bg-muted flex items-center gap-2"
+                  onSelect={handleExportComments}
+                >
+                  <MessageSquareIcon className="w-4 h-4 stroke-[1.6]" />
+                  Export Comments
                 </DropdownMenu.Item>
               </DropdownMenu.Content>
             </DropdownMenu.Portal>

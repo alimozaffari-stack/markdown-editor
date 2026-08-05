@@ -14,7 +14,7 @@ import { useTheme } from "../../context/ThemeContext";
 import { useGit } from "../../context/GitContext";
 import * as notesService from "../../services/notes";
 import * as aiService from "../../services/ai";
-import { downloadPdf, downloadMarkdown } from "../../services/pdf";
+import { downloadPdf, downloadMarkdown, exportComments } from "../../services/pdf";
 import type { Settings } from "../../types/note";
 import type { Editor } from "@tiptap/react";
 import {
@@ -58,6 +58,7 @@ import {
   ImageIcon,
   ArchiveIcon,
   CalendarIcon,
+  MessageSquareIcon,
   LetterCaseIcon,
 } from "../icons";
 import { mod, shift } from "../../lib/platform";
@@ -94,6 +95,7 @@ export function CommandPalette({
 }: CommandPaletteProps) {
   const {
     notes,
+    commentsMap,
     selectNote,
     createNote,
     deleteNote,
@@ -477,6 +479,36 @@ export function CommandPalette({
             } catch (error) {
               console.error("Failed to download markdown:", error);
               toast.error("Failed to save markdown");
+            }
+          },
+        },
+        {
+          id: "export-comments",
+          label: "Export Comments",
+          icon: <MessageSquareIcon className="w-4.5 h-4.5 stroke-[1.5]" />,
+          action: async () => {
+            try {
+              if (!currentNote) {
+                toast.error("No note selected");
+                return;
+              }
+              const comments = commentsMap?.[currentNote.id] || [];
+              if (comments.length === 0) {
+                toast.info("No comments to export");
+                return;
+              }
+              const saved = await exportComments(
+                comments,
+                currentNote.title,
+                currentNote.id
+              );
+              if (saved) {
+                toast.success("Comments exported successfully");
+                onClose();
+              }
+            } catch (error) {
+              console.error("Failed to export comments:", error);
+              toast.error("Failed to export comments");
             }
           },
         },

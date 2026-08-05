@@ -2,6 +2,8 @@ import { useState, useMemo, useCallback, useEffect } from "react";
 import { useNotes } from "../../context/NotesContext";
 import { cleanTitle } from "../../lib/utils";
 import { TrashIcon } from "../icons";
+import { exportComments } from "../../services/pdf";
+import { toast } from "sonner";
 
 export function CommentsModal() {
   const {
@@ -53,39 +55,24 @@ export function CommentsModal() {
     [handleAdd]
   );
 
-  const handleExportComments = useCallback(() => {
-    if (!activeNote || comments.length === 0) return;
+  const handleExportComments = useCallback(async () => {
+    if (!activeNote) return;
+
+    if (comments.length === 0) {
+      toast.info("No comments to export");
+      return;
+    }
 
     const title = cleanTitle(activeNote.title);
-    const contentLines = [
-      `# Comments on: ${title}`,
-      `Document ID: ${activeNote.id}`,
-      `Exported: ${new Date().toLocaleString()}`,
-      "",
-      "---",
-      "",
-    ];
-
-    comments.forEach((comment, idx) => {
-      const dateStr = new Date(comment.timestamp * 1000).toLocaleString();
-      contentLines.push(`### Comment #${idx + 1}`);
-      contentLines.push(`**Date:** ${dateStr}`);
-      contentLines.push(`**Text:**`);
-      contentLines.push(comment.text);
-      contentLines.push("");
-      contentLines.push("---");
-      contentLines.push("");
-    });
-
-    const blob = new Blob([contentLines.join("\n")], { type: "text/markdown" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-comments.md`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    try {
+      const saved = await exportComments(comments, title, activeNote.id);
+      if (saved) {
+        toast.success("Comments exported successfully");
+      }
+    } catch (error) {
+      console.error("Failed to export comments:", error);
+      toast.error("Failed to export comments");
+    }
   }, [activeNote, comments]);
 
   if (!activeCommentsNoteId || !activeNote) return null;
@@ -193,29 +180,25 @@ export function CommentsModal() {
             />
           </div>
           <div className="flex items-center justify-between gap-3">
-            {comments.length > 0 ? (
-              <button
-                onClick={handleExportComments}
-                className="text-xs text-text-muted hover:text-text flex items-center gap-1.5 px-2.5 py-1.5 rounded-md hover:bg-bg-muted transition-colors cursor-pointer font-medium"
+            <button
+              onClick={handleExportComments}
+              className="text-xs text-text-muted hover:text-text flex items-center gap-1.5 px-2.5 py-1.5 rounded-md hover:bg-bg-muted transition-colors cursor-pointer font-medium"
+            >
+              <svg
+                className="w-4 h-4"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+                strokeWidth="2"
               >
-                <svg
-                  className="w-4 h-4"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                  strokeWidth="2"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
-                  />
-                </svg>
-                Export Comments
-              </button>
-            ) : (
-              <div />
-            )}
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
+                />
+              </svg>
+              Export Comments
+            </button>
             <div className="flex gap-2">
               <button
                 onClick={handleClose}
