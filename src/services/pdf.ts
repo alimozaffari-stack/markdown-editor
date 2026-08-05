@@ -31,32 +31,58 @@ export async function downloadMarkdown(
 ): Promise<boolean> {
   const sanitizedTitle = sanitizeFilename(noteTitle);
 
-  // Show native save dialog
-  const filePath = await save({
-    defaultPath: `${sanitizedTitle}.md`,
-    filters: [{ name: "Markdown", extensions: ["md"] }],
-  });
+  const isTauri =
+    typeof window !== "undefined" &&
+    (window as any).__TAURI_INTERNALS__ !== undefined;
 
-  if (!filePath) return false; // User cancelled
+  if (isTauri) {
+    // Show native save dialog
+    const filePath = await save({
+      defaultPath: `${sanitizedTitle}.md`,
+      filters: [{ name: "Markdown", extensions: ["md"] }],
+    });
 
-  // Convert string to bytes and write file using Tauri command
-  const encoder = new TextEncoder();
-  const uint8Array = encoder.encode(markdown);
-  await invoke("write_file", {
-    path: filePath,
-    contents: Array.from(uint8Array)
-  });
+    if (!filePath) return false; // User cancelled
 
-  return true;
+    // Convert string to bytes and write file using Tauri command
+    const encoder = new TextEncoder();
+    const uint8Array = encoder.encode(markdown);
+    await invoke("write_file", {
+      path: filePath,
+      contents: Array.from(uint8Array),
+    });
+
+    return true;
+  } else {
+    // Frontend Blob download branch
+    try {
+      const blob = new Blob([markdown], { type: "text/markdown" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${sanitizedTitle}.md`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+      }, 1000);
+      return true;
+    } catch (e) {
+      console.error("Browser download failed:", e);
+      return false;
+    }
+  }
 }
 
 /**
  * Sanitizes a filename by removing invalid characters.
- * Replaces filesystem-unsafe characters with dashes.
+ * Replaces filesystem-unsafe characters with underscores.
  *
  * @param name - The filename to sanitize
  * @returns A filesystem-safe filename
  */
 function sanitizeFilename(name: string): string {
-  return name.replace(/[/\\?%*:|"<>]/g, "-").trim() || "note";
+  return name.replace(/[/\\?%*:|"<>]/g, "_").trim() || "note";
 }
+

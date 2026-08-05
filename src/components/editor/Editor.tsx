@@ -798,6 +798,7 @@ export function Editor({
     hasSelection: boolean;
     isHighlighted: boolean;
   } | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const sourceTimeoutRef = useRef<number | null>(null);
   const sourceModeTransitionRef = useRef<{
     topBlockIndex: number;
@@ -3225,18 +3226,52 @@ export function Editor({
     e.stopPropagation();
 
     const menuWidth = 230;
-    const menuHeight = 260;
-    const x = Math.min(e.clientX, window.innerWidth - menuWidth - 12);
-    const y = Math.min(e.clientY, window.innerHeight - menuHeight - 12);
+    const menuHeight = contextMenuRef.current?.offsetHeight || 320;
+    const padding = 10;
+
+    let top = e.clientY;
+    let left = e.clientX;
+
+    if (top + menuHeight > window.innerHeight) {
+      top = Math.max(padding, window.innerHeight - menuHeight - padding);
+    }
+    if (left + menuWidth > window.innerWidth) {
+      left = Math.max(padding, window.innerWidth - menuWidth - padding);
+    }
 
     setEditorContextMenu({
-      x: Math.max(12, x),
-      y: Math.max(12, y),
+      x: left,
+      y: top,
       selectedText,
       hasSelection,
       isHighlighted: !sourceMode && editor ? editor.isActive("highlight") : false,
     });
   }, [editor, sourceMode]);
+
+  useLayoutEffect(() => {
+    if (editorContextMenu && contextMenuRef.current) {
+      const rect = contextMenuRef.current.getBoundingClientRect();
+      const menuWidth = rect.width || 230;
+      const menuHeight = rect.height || 320;
+      const padding = 10;
+
+      let clampedY = editorContextMenu.y;
+      let clampedX = editorContextMenu.x;
+
+      if (clampedY + menuHeight > window.innerHeight - padding) {
+        clampedY = Math.max(padding, window.innerHeight - menuHeight - padding);
+      }
+      if (clampedX + menuWidth > window.innerWidth - padding) {
+        clampedX = Math.max(padding, window.innerWidth - menuWidth - padding);
+      }
+
+      if (clampedX !== editorContextMenu.x || clampedY !== editorContextMenu.y) {
+        setEditorContextMenu((prev) =>
+          prev ? { ...prev, x: clampedX, y: clampedY } : null
+        );
+      }
+    }
+  }, [editorContextMenu?.x, editorContextMenu?.y]);
 
   const handleContextHighlight = useCallback((color?: string) => {
     if (sourceMode) {
@@ -4340,12 +4375,13 @@ export function Editor({
             }}
           />
           <div
+            ref={contextMenuRef}
             style={{
               position: "fixed",
               top: editorContextMenu.y,
               left: editorContextMenu.x,
             }}
-            className="z-50 min-w-56 bg-bg border border-border/80 rounded-xl shadow-2xl py-1.5 animate-scale-in text-xs text-text font-sans divide-y divide-border/40 select-none"
+            className="custom-context-menu z-50 min-w-56 bg-bg border border-border/80 rounded-xl shadow-2xl py-1.5 animate-scale-in text-xs text-text font-sans divide-y divide-border/40 select-none"
           >
             {/* Highlight Section */}
             <div className="py-1">
